@@ -180,6 +180,11 @@ impl Config {
         if !valid_address(&self.address) {
             return Err(ConfigError::new("address must be host:port"));
         }
+        if self.fetch.max_concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::new(
+                "fetch.max_concurrency exceeds runtime capacity",
+            ));
+        }
         for (name, value) in [
             ("search.max_results", self.search.max_results as u64),
             ("search.engine_timeout", self.search.engine_timeout),
@@ -200,6 +205,7 @@ impl Config {
             }
         }
         self.engines.validate().map_err(ConfigError::new)?;
+        self.validate_machine()?;
         Ok(())
     }
 }
@@ -234,6 +240,21 @@ fn is_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Invalid concurrency is a configuration error, not a semaphore panic when
+    /// the new shared fetch/extraction scheduler is constructed.
+    #[test]
+    fn excessive_fetch_concurrency_is_rejected_before_open() {
+        let mut config = Config {
+            home: std::env::temp_dir().canonicalize().unwrap(),
+            ..Config::default()
+        };
+        config.fetch.max_concurrency = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert_eq!(
+            config.validate().unwrap_err().message(),
+            "fetch.max_concurrency exceeds runtime capacity"
+        );
+    }
 
     #[test]
     fn parse_diagnostics_identify_fields_without_quoting_values() {
@@ -374,5 +395,42 @@ mod tests {
         let config = load(Some(path)).unwrap();
         assert_eq!(config.home, home().unwrap());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Machine settings reject unusable ceilings while zero depth/delay remain useful.
+    #[test]
+    fn machine_bounds_and_processor_configuration_validate() {
+        for (section, field) in [
+            ("research", "sources"),
+            ("research", "source_characters"),
+            ("research", "total_characters"),
+            ("research", "max_per_host"),
+            ("research", "max_attempts"),
+            ("research", "timeout"),
+            ("research", "session_entries"),
+            ("research", "read_characters"),
+            ("crawl", "max_pages"),
+            ("crawl", "max_bytes"),
+            ("crawl", "timeout"),
+            ("processing", "timeout"),
+            ("processing", "max_output_bytes"),
+        ] {
+            let mut input = serde_json::json!({});
+            input[section] = serde_json::json!({field: 0});
+            let config: Config = serde_json::from_value(input).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(&format!("{section}.{field}")), "{error}");
+        }
+        let config: Config = serde_json::from_value(
+            serde_json::json!({"crawl":{"max_depth":0,"delay":0}, "research":{"session_ttl":0}}),
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let config: Config = serde_json::from_value(
+            serde_json::json!({"processing":{"reranker":{"command":"./secret"}}}),
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("processing.reranker"));
+        assert!(!error.contains("secret"));
     }
 }

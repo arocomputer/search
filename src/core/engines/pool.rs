@@ -19,6 +19,7 @@ use crate::core::{Answer, Link, Query};
 pub struct Pool {
     engines: Vec<Arc<dyn Engine>>,
     settings: SearchSettings,
+    cache: std::sync::Mutex<super::cache::Cache>,
 }
 
 impl Pool {
@@ -41,6 +42,7 @@ impl Pool {
         Ok(Self {
             engines,
             settings: config.search.clone(),
+            cache: Default::default(),
         })
     }
 
@@ -57,6 +59,24 @@ impl Pool {
     /// Run the query across every selected engine and merge the answers.
     pub async fn search(&self, query: Query) -> Answer {
         let started = Instant::now();
+        if let Err(error) = query.filters.validate() {
+            return Answer {
+                query: query.text,
+                results: Vec::new(),
+                engines: vec![failed("query", EngineStatus::Error, error, 0)],
+                duration_ms: 0,
+            };
+        }
+        let key = serde_json::to_string(&query).unwrap_or_default();
+        let ttl = Duration::from_millis(self.settings.cache_ttl);
+        if !ttl.is_zero() && self.settings.cache_bytes > 0 {
+            if let Ok(mut cache) = self.cache.lock() {
+                if let Some(mut answer) = cache.get(&key, ttl) {
+                    answer.duration_ms = started.elapsed().as_millis() as u64;
+                    return answer;
+                }
+            }
+        }
         let limit = self.settings.result_limit(query.limit);
         let selected: Vec<Arc<dyn Engine>> = self.select(&query.engines);
         let per_engine_time = self.settings.engine_timeout();
@@ -65,9 +85,9 @@ impl Pool {
         let mut tasks = HashMap::new();
         for (index, engine) in selected.iter().enumerate() {
             let engine = Arc::clone(engine);
-            let text = query.text.clone();
+            let request = query.clone();
             let task =
-                set.spawn(async move { run_engine(engine, text, limit, per_engine_time).await });
+                set.spawn(async move { run_engine(engine, request, limit, per_engine_time).await });
             tasks.insert(task.id(), index);
         }
 
@@ -92,7 +112,9 @@ impl Pool {
                     continue;
                 };
                 *slot = Some(outcome.unwrap_or_else(|| {
-                    let state = failed(engine.name(), EngineStatus::Error, "engine task failed", 0);
+                    let mut state =
+                        failed(engine.name(), EngineStatus::Error, "engine task failed", 0);
+                    state.unsupported_filters = engine.unsupported_filters(&query.filters);
                     (state, Vec::new())
                 }));
             }
@@ -106,12 +128,13 @@ impl Pool {
             for (index, engine) in selected.iter().enumerate() {
                 if let Some(slot) = collected.get_mut(index) {
                     if slot.is_none() {
-                        let state = failed(
+                        let mut state = failed(
                             engine.name(),
                             EngineStatus::Timeout,
                             "engine exceeded the overall search deadline",
                             started.elapsed().as_millis() as u64,
                         );
+                        state.unsupported_filters = engine.unsupported_filters(&query.filters);
                         *slot = Some((state, Vec::new()));
                     }
                 }
@@ -129,7 +152,11 @@ impl Pool {
             })
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|name| failed(name, EngineStatus::Error, "engine is not enabled", 0))
+            .map(|name| {
+                let mut state = failed(name, EngineStatus::Error, "engine is not enabled", 0);
+                state.unsupported_filters = query.filters.values().into_keys().collect();
+                state
+            })
             .collect();
         let mut merged = Vec::new();
         for slot in collected.into_iter().flatten() {
@@ -140,12 +167,16 @@ impl Pool {
         states.sort_by(|a, b| a.name.cmp(&b.name));
 
         let results = fuse(&merged, limit);
-        Answer {
+        let answer = Answer {
             query: query.text,
             results,
             engines: states,
             duration_ms: started.elapsed().as_millis() as u64,
+        };
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(key, &answer, ttl, self.settings.cache_bytes);
         }
+        answer
     }
 
     /// Restrict to the requested names, preserving pool order. A request for
@@ -170,6 +201,7 @@ fn failed(name: &str, status: EngineStatus, error: &str, elapsed_ms: u64) -> Eng
         status,
         count: 0,
         skipped: 0,
+        unsupported_filters: Vec::new(),
         error: Some(error.into()),
         elapsed_ms,
     }
@@ -181,16 +213,26 @@ fn failed(name: &str, status: EngineStatus, error: &str, elapsed_ms: u64) -> Eng
 /// results land in the merged concatenation.
 async fn run_engine(
     engine: Arc<dyn Engine>,
-    query: String,
+    query: Query,
     limit: usize,
     budget: Duration,
 ) -> (EngineState, Vec<Ranked>) {
     let name = engine.name().to_string();
     let started = Instant::now();
-    let outcome = tokio::time::timeout(budget, engine.search(query, limit)).await;
+    let requested_filters = query.filters.values();
+    let mut unsupported_filters = engine.unsupported_filters(&query.filters);
+    let outcome = tokio::time::timeout(budget, engine.search_query(query, limit)).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-    let (status, Found { links, skipped }, error) = match outcome {
+    let (
+        status,
+        Found {
+            links,
+            skipped,
+            unsupported_filters: reported,
+        },
+        error,
+    ) = match outcome {
         Ok(Ok(found)) => (EngineStatus::Ok, found, None),
         Ok(Err(error)) => {
             let status = match error.cause {
@@ -205,6 +247,12 @@ async fn run_engine(
             Some(EngineError::network("engine exceeded its deadline").message),
         ),
     };
+    for field in reported {
+        if requested_filters.contains_key(&field) && !unsupported_filters.contains(&field) {
+            unsupported_filters.push(field);
+        }
+    }
+    unsupported_filters.sort();
     // Stamp each link with its rank in this engine's own ordering; fusion
     // scores on that, not on where it lands in the merged concatenation.
     let results: Vec<Ranked> = links
@@ -221,6 +269,7 @@ async fn run_engine(
         status,
         count: results.len(),
         skipped,
+        unsupported_filters,
         error,
         elapsed_ms,
     };
@@ -264,8 +313,12 @@ fn fuse(results: &[Ranked], limit: usize) -> Vec<Link> {
             aggregate
         });
         let incoming = &ranked.link;
+        merge_passages(&mut existing.link, incoming);
         if existing.link.snippet.is_none() {
             existing.link.snippet = incoming.snippet.clone();
+        }
+        if existing.link.published.is_none() {
+            existing.link.published = incoming.published.clone();
         }
         if existing.link.title.is_empty() && !incoming.title.is_empty() {
             existing.link.title = incoming.title.clone();
@@ -305,19 +358,98 @@ fn fuse(results: &[Ranked], limit: usize) -> Vec<Link> {
         .collect()
 }
 
+/// Keep distinct snippets and update metadata when several sources discover one URL.
+fn merge_passages(target: &mut Link, incoming: &Link) {
+    for snippet in target
+        .snippet
+        .clone()
+        .iter()
+        .chain(incoming.snippet.iter())
+        .chain(incoming.snippets.iter())
+    {
+        if !target.snippets.contains(snippet) {
+            target.snippets.push(snippet.clone());
+        }
+    }
+    if target.updated.is_none() {
+        target.updated = incoming.updated.clone();
+    }
+}
+
+/// Merge the per-query answers of a research fan-out into one ranked list.
+/// Each answer's results are already fused and ordered, so their position is
+/// the rank this merge votes with — the same reciprocal-rank formula [`fuse`]
+/// uses within one query, so agreement across queries raises a source.
+pub(crate) fn fuse_answers(answers: &[Answer]) -> Vec<Link> {
+    const K: f64 = 10.0;
+
+    struct Aggregate {
+        link: Link,
+        score: f64,
+        order: usize,
+    }
+
+    let mut seen: HashMap<String, Aggregate> = HashMap::new();
+    let mut order = 0usize;
+    for answer in answers {
+        for (position, link) in answer.results.iter().enumerate() {
+            let key = normalize_url(&link.url);
+            if key.is_empty() {
+                continue;
+            }
+            let aggregate = seen.entry(key).or_insert_with(|| {
+                let aggregate = Aggregate {
+                    link: link.clone(),
+                    score: 0.0,
+                    order,
+                };
+                order += 1;
+                aggregate
+            });
+            aggregate.score += 1.0 / (K + (position + 1) as f64);
+            merge_passages(&mut aggregate.link, link);
+            if aggregate.link.snippet.is_none() {
+                aggregate.link.snippet = link.snippet.clone();
+            }
+            if aggregate.link.published.is_none() {
+                aggregate.link.published = link.published.clone();
+            }
+            if aggregate.link.title.is_empty() && !link.title.is_empty() {
+                aggregate.link.title = link.title.clone();
+            }
+            for engine in &link.engines {
+                if !aggregate.link.engines.contains(engine) {
+                    aggregate.link.engines.push(engine.clone());
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<Aggregate> = seen.into_values().collect();
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.order.cmp(&b.order))
+    });
+    out.into_iter()
+        .map(|mut aggregate| {
+            aggregate.link.score = aggregate.score;
+            aggregate.link
+        })
+        .collect()
+}
+
 /// Normalize a URL for deduplication: lowercased scheme and host, no fragment,
-/// no tracking parameters, no trailing slash. It never drops a meaningful query:
+/// no tracking parameters. Preserve path slashes and the raw encoding of meaningful
+/// query parameters; servers may distinguish them. It never drops a meaningful query:
 /// `ref` stays, because it selects a branch or tag on code hosts.
-pub(super) fn normalize_url(raw: &str) -> String {
+pub(crate) fn normalize_url(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw.trim()) else {
         return String::new();
     };
     if url.scheme() != "http" && url.scheme() != "https" {
         return String::new();
-    }
-    let _ = url.set_scheme(&url.scheme().to_ascii_lowercase());
-    if let Some(host) = url.host_str() {
-        let _ = url.set_host(Some(&host.to_ascii_lowercase()));
     }
     url.set_fragment(None);
     let tracking = [
@@ -331,22 +463,20 @@ pub(super) fn normalize_url(raw: &str) -> String {
         "mc_cid",
         "mc_eid",
     ];
-    let kept: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(k, _)| !tracking.contains(&k.as_ref()))
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    if kept.is_empty() {
-        url.set_query(None);
-    } else {
-        let mut pairs = url.query_pairs_mut();
-        pairs.clear();
-        for (k, v) in &kept {
-            pairs.append_pair(k, v);
+    if let Some(query) = url.query() {
+        let kept: Vec<&str> = query
+            .split('&')
+            .filter(|part| {
+                !url::form_urlencoded::parse(part.as_bytes())
+                    .next()
+                    .is_some_and(|(key, _)| tracking.contains(&key.as_ref()))
+            })
+            .collect();
+        let filtered = kept.join("&");
+        if filtered != query {
+            url.set_query((!filtered.is_empty()).then_some(filtered.as_str()));
         }
     }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
     url.to_string()
 }
 
@@ -373,6 +503,7 @@ mod tests {
                     })
                     .collect(),
                 settings,
+                cache: Default::default(),
             }
         }
     }
@@ -403,11 +534,15 @@ mod tests {
                             title: format!("result {i}"),
                             url: format!("https://example.com/{i}"),
                             snippet: None,
+                            snippets: Vec::new(),
+                            updated: None,
+                            published: None,
                             engines: vec!["test".into()],
                             score: 0.0,
                         })
                         .collect(),
                     skipped: 0,
+                    unsupported_filters: Vec::new(),
                 })
             })
         }
@@ -417,6 +552,7 @@ mod tests {
         Pool {
             engines: vec![Arc::new(engine)],
             settings,
+            cache: Default::default(),
         }
     }
 
@@ -472,6 +608,7 @@ mod tests {
                 text: "test".into(),
                 limit: 10,
                 engines: Vec::new(),
+                ..Default::default()
             })
             .await;
 
@@ -574,6 +711,9 @@ mod tests {
                 title: url.into(),
                 url: url.into(),
                 snippet: None,
+                snippets: Vec::new(),
+                updated: None,
+                published: None,
                 engines: vec![engine.into()],
                 score: 0.0,
             },
@@ -636,7 +776,7 @@ mod tests {
     fn fusion_counts_one_vote_per_engine_and_normalized_url() {
         for duplicate in [
             "https://b.example/y",
-            "https://b.example/y/?utm_source=noise#section",
+            "https://b.example/y?utm_source=noise#section",
         ] {
             let merged = vec![
                 ranked("https://a.example/x", "one", 1),
@@ -701,7 +841,7 @@ mod tests {
     #[test]
     fn url_normalization_dedupes_noise() {
         assert_eq!(
-            normalize_url("https://Example.com/Path/?utm_source=news&id=7#frag"),
+            normalize_url("https://Example.com/Path?utm_source=news&id=7#frag"),
             normalize_url("https://example.com/Path?id=7")
         );
         assert!(normalize_url("javascript:alert(1)").is_empty());
@@ -709,5 +849,209 @@ mod tests {
             normalize_url("https://github.com/o/r/blob/x?ref=main"),
             normalize_url("https://github.com/o/r/blob/x?ref=dev")
         );
+    }
+
+    /// Servers can serve distinct bodies at a path and its slash-suffixed form;
+    /// discovery must retain both as candidates rather than silently losing one.
+    #[test]
+    fn fusion_preserves_significant_path_slashes() {
+        let out = fuse(
+            &[
+                ranked("https://example.com/article", "one", 1),
+                ranked("https://example.com/article/", "one", 2),
+            ],
+            10,
+        );
+        assert_eq!(out.len(), 2);
+        assert_ne!(out[0].url, out[1].url);
+    }
+
+    /// Removing tracking must preserve meaningful query spelling, including
+    /// bare flags and percent encoding used by strict or signed endpoints.
+    #[test]
+    fn url_normalization_preserves_raw_meaningful_query() {
+        assert_eq!(
+            normalize_url("https://example.com/?flag&value=a%20b&utm_source=noise"),
+            "https://example.com/?flag&value=a%20b",
+        );
+        assert_ne!(
+            normalize_url("https://example.com/?flag"),
+            normalize_url("https://example.com/?flag="),
+        );
+        assert_eq!(
+            normalize_url("https://example.com/?"),
+            "https://example.com/?"
+        );
+    }
+
+    /// A URL two queries both rank first beats a top hit from only one query.
+    #[test]
+    fn fuse_answers_rewards_cross_query_agreement() {
+        let answer = |urls: [&str; 2]| Answer {
+            query: "q".into(),
+            results: urls
+                .into_iter()
+                .map(|url| ranked(url, "e", 1).link)
+                .collect(),
+            engines: Vec::new(),
+            duration_ms: 0,
+        };
+        let merged = fuse_answers(&[
+            answer(["https://a.example/x", "https://b.example/y"]),
+            answer(["https://a.example/x", "https://c.example/z"]),
+        ]);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].url, "https://a.example/x");
+    }
+
+    /// Cache keys separate every constraint, text, requested limit and engine selection.
+    #[tokio::test]
+    async fn answer_cache_isolates_full_requests_and_expires() {
+        struct Counting(Arc<AtomicUsize>);
+        impl Engine for Counting {
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn search(&self, _: String, _: usize) -> super::super::EngineFuture {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(Found::default()) })
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pool = Pool {
+            engines: vec![Arc::new(Counting(calls.clone()))],
+            settings: SearchSettings {
+                cache_ttl: 200,
+                ..Default::default()
+            },
+            cache: Default::default(),
+        };
+        let base = Query {
+            text: "q".into(),
+            ..Default::default()
+        };
+        let invalid = pool
+            .search(Query {
+                filters: crate::core::service::QueryFilters {
+                    start_date: Some("2023-02-29".into()),
+                    ..Default::default()
+                },
+                ..base.clone()
+            })
+            .await;
+        assert_eq!(invalid.engines[0].status, EngineStatus::Error);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        pool.search(base.clone()).await;
+        pool.search(base.clone()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for variant in [
+            Query {
+                text: "other".into(),
+                ..base.clone()
+            },
+            Query {
+                limit: 1,
+                ..base.clone()
+            },
+            Query {
+                engines: vec!["count".into()],
+                ..base.clone()
+            },
+            Query {
+                filters: crate::core::service::QueryFilters {
+                    safe: Some(false),
+                    ..Default::default()
+                },
+                ..base.clone()
+            },
+        ] {
+            pool.search(variant.clone()).await;
+            pool.search(variant).await;
+        }
+        for filters in [
+            serde_json::json!({"freshness":"week"}),
+            serde_json::json!({"start_date":"2024-01-01"}),
+            serde_json::json!({"end_date":"2024-02-01"}),
+            serde_json::json!({"include_domains":["example.com"]}),
+            serde_json::json!({"exclude_domains":["example.com"]}),
+            serde_json::json!({"language":"en"}),
+            serde_json::json!({"region":"GB"}),
+            serde_json::json!({"category":"science"}),
+            serde_json::json!({"exact_phrase":"a phrase"}),
+        ] {
+            let variant = Query {
+                filters: serde_json::from_value(filters).unwrap(),
+                ..base.clone()
+            };
+            pool.search(variant.clone()).await;
+            pool.search(variant).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 14);
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        pool.search(base).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 15);
+    }
+
+    /// Engine failures never become reusable empty answers.
+    #[tokio::test]
+    async fn answer_cache_never_stores_errors_or_timeouts() {
+        struct Failing(Arc<AtomicUsize>);
+        impl Engine for Failing {
+            fn name(&self) -> &str {
+                "failure"
+            }
+            fn search(&self, _: String, _: usize) -> super::super::EngineFuture {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if call == 0 {
+                        Err(EngineError::rejected("fixture"))
+                    } else if call == 1 {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Ok(Found::default())
+                    } else {
+                        Ok(Found::default())
+                    }
+                })
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pool = Pool {
+            engines: vec![Arc::new(Failing(calls.clone()))],
+            settings: SearchSettings {
+                engine_timeout: 20,
+                ..Default::default()
+            },
+            cache: Default::default(),
+        };
+        assert_eq!(
+            pool.search(Query::default()).await.engines[0].status,
+            EngineStatus::Error
+        );
+        assert_eq!(
+            pool.search(Query::default()).await.engines[0].status,
+            EngineStatus::Timeout
+        );
+        assert_eq!(
+            pool.search(Query::default()).await.engines[0].status,
+            EngineStatus::Ok
+        );
+        pool.search(Query::default()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Fusion keeps every distinct passage and separates update from publication.
+    #[test]
+    fn fusion_preserves_multiple_snippets_and_updated() {
+        let mut a = ranked("https://example.com", "a", 1);
+        a.link.snippet = Some("one".into());
+        a.link.snippets = vec!["one".into(), "two".into()];
+        let mut b = ranked("https://example.com", "b", 1);
+        b.link.snippet = Some("three".into());
+        b.link.snippets = vec!["two".into(), "four".into()];
+        b.link.updated = Some("2024-03-01".into());
+        let result = fuse(&[a, b], 10);
+        assert_eq!(result[0].snippets, ["one", "two", "three", "four"]);
+        assert_eq!(result[0].updated.as_deref(), Some("2024-03-01"));
+        assert!(result[0].published.is_none());
     }
 }

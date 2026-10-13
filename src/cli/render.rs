@@ -47,7 +47,20 @@ pub fn search(answer: &Answer) -> i32 {
         answer.results.len(),
         answer.duration_ms
     );
-    for engine in &answer.engines {
+    engine_health(&answer.engines);
+    0
+}
+
+/// Report partial engine execution and unsupported filters without hiding empty answers.
+fn engine_health(engines: &[crate::core::engines::EngineState]) {
+    for engine in engines {
+        if !engine.unsupported_filters.is_empty() {
+            eprintln!(
+                "{}: unsupported filters: {}",
+                terminal_text(&engine.name),
+                terminal_text(&engine.unsupported_filters.join(", "))
+            );
+        }
         let status = match engine.status {
             EngineStatus::Error => "failed",
             EngineStatus::Timeout => "timed out",
@@ -68,7 +81,6 @@ pub fn search(answer: &Answer) -> i32 {
                 .unwrap_or_default()
         );
     }
-    0
 }
 
 /// Render fetched page text. A failed URL is printed in place, so its result stays
@@ -90,26 +102,132 @@ pub fn fetch(results: &[FocusedPage]) {
         }
         match &read.passages {
             Some(passages) => {
-                let texts: Vec<String> = passages
-                    .iter()
-                    .map(|p| terminal_text(p.text.as_str()))
-                    .collect();
-                println!("{}\n", texts.join("\n\n…\n\n"));
+                for passage in passages {
+                    println!("{}\n", terminal_text(&passage.text));
+                    if let Some(offset) = passage.next_offset {
+                        println!(
+                            "[passage continues; read on without -query using -offset {offset}]\n"
+                        );
+                    }
+                }
             }
             None => println!("{}\n", terminal_text(&page.text)),
         }
         if let Some(offset) = read.next_offset {
             println!("[continues; read on with -offset {offset}]\n");
-        } else if page.truncated == Some(true) {
+        }
+        if page.truncated == Some(true) {
             println!("[truncated at fetch.max_response_bytes]\n");
         }
     }
+}
+
+/// Render an evidence packet for a person: each source with its date and
+/// passages, and the coverage line on stderr.
+pub fn research(packet: &crate::core::Packet) -> i32 {
+    if let Some(synthesis) = &packet.synthesis {
+        println!("{}\n", terminal_text(synthesis));
+    }
+    for error in &packet.processing_errors {
+        eprintln!("processing: {}", terminal_text(error));
+    }
+    for source in &packet.sources {
+        let title = source.title.as_deref().unwrap_or(&source.url);
+        println!("## {}", terminal_text(title));
+        println!(
+            "{}\n({})\n",
+            terminal_text(&source.url),
+            terminal_text(source.published.as_deref().unwrap_or("no date"))
+        );
+        if let Some(error) = &source.error {
+            println!("Fetch failed: {}\n", terminal_text(error));
+            continue;
+        }
+        for passage in &source.passages {
+            println!("{}\n", terminal_text(&passage.text));
+            if let Some(offset) = passage.next_offset {
+                println!("[passage continues; search read URL -offset {offset}]\n");
+            }
+        }
+        if let Some(offset) = source.next_offset {
+            println!("[continues; search read URL -offset {offset}]\n");
+        }
+        if source.truncated {
+            println!("[truncated at fetch.max_response_bytes]\n");
+        }
+    }
+    engine_health(&packet.engines);
+    if packet.timed_out {
+        eprintln!("research: timed out");
+    }
+    if packet.incomplete {
+        eprintln!("research: incomplete evidence packet");
+    }
+    eprintln!(
+        "{} sources · {} candidates · {} read · {} failed · {} skipped · {} chars · {} ms",
+        packet.sources.len(),
+        packet.coverage.candidates,
+        packet.coverage.read,
+        packet.coverage.failed,
+        packet.coverage.skipped,
+        packet.characters,
+        packet.duration_ms,
+    );
+    0
 }
 
 /// Print a human diagnostic without terminal controls and return failure status.
 pub fn error(message: String) -> i32 {
     eprintln!("search: {}", terminal_text(&message));
     1
+}
+
+/// Render a site inventory with honest bounds and per-URL failures.
+pub fn crawl(report: &crate::core::CrawlReport) -> i32 {
+    for url in &report.urls {
+        println!("{}", terminal_text(url));
+    }
+    for page in &report.pages {
+        println!(
+            "\n## {}\n{}\n\n{}",
+            terminal_text(page.title.as_deref().unwrap_or(&page.url)),
+            terminal_text(&page.url),
+            terminal_text(&page.text)
+        );
+        if page.truncated == Some(true) {
+            eprintln!(
+                "{}: truncated at fetch.max_response_bytes",
+                terminal_text(&page.url)
+            );
+        }
+        if let Some(window) = report.windows.iter().find(|window| window.url == page.url) {
+            if let Some(offset) = window.next_offset {
+                eprintln!(
+                    "{}: continue with search read URL -offset {offset}",
+                    terminal_text(&page.url)
+                );
+            }
+        }
+    }
+    eprintln!(
+        "{} visited · {} bytes · {} ms{}{}",
+        report.visited,
+        report.bytes,
+        report.duration_ms,
+        if report.timed_out {
+            " · timed out"
+        } else {
+            ""
+        },
+        if report.truncated { " · bounded" } else { "" }
+    );
+    for failure in &report.failures {
+        eprintln!(
+            "{}",
+            terminal_text(&serde_json::to_string(failure).unwrap_or_default())
+        );
+    }
+    0
 }
 
 #[cfg(test)]

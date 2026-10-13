@@ -9,6 +9,12 @@ mod cache;
 mod extract;
 pub(crate) mod guard;
 
+/// Apply the reader's image/reference neutralization to optional generated prose.
+/// Edge processors are trusted programs, but their returned text is still data.
+pub(crate) fn sanitize_text(text: &str) -> String {
+    extract::sanitize(text)
+}
+
 use std::time::Duration;
 
 use crate::core::config::FetchSettings;
@@ -58,6 +64,9 @@ pub struct Page {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
     pub text: String,
+    /// Opt-in navigation targets, kept separate from model prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     /// A client-side redirect target, followed by the caller. Not serialized:
@@ -113,6 +122,43 @@ pub struct Fetcher {
     client: reqwest::Client,
     cache: cache::Cache,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
+    crawl_hosts: tokio::sync::Mutex<std::collections::HashMap<String, CrawlHost>>,
+}
+
+/// Shared crawl scheduling serializes each host without holding network permits
+/// during politeness waits. Active records cannot be evicted out from under work.
+struct CrawlHost {
+    touched: std::time::Instant,
+    schedule: std::sync::Arc<tokio::sync::Mutex<CrawlSchedule>>,
+}
+
+#[derive(Default)]
+struct CrawlSchedule {
+    last: Option<std::time::Instant>,
+    delay: Duration,
+}
+
+/// Abort queued blocking work when its caller stops waiting. Running work keeps
+/// its owned permit until completion because Tokio cannot stop a running thread.
+struct BlockingWork<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for BlockingWork<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Record completion even when a request errors or its future is cancelled.
+/// Waiting for politeness or a global permit does not count as a request.
+struct CrawlSlot<'a> {
+    schedule: tokio::sync::MutexGuard<'a, CrawlSchedule>,
+    started: bool,
+}
+impl Drop for CrawlSlot<'_> {
+    fn drop(&mut self) {
+        if self.started {
+            self.schedule.last = Some(std::time::Instant::now());
+        }
+    }
 }
 
 impl Fetcher {
@@ -120,8 +166,6 @@ impl Fetcher {
     /// The client reuses no default transport: a [`guard::GuardedResolver`] vets
     /// every address at connect time, and redirects are re-validated per hop.
     pub fn new(settings: FetchSettings, user_agent: &str) -> Result<Self, reqwest::Error> {
-        let redirects = settings.max_redirects;
-        let allow_private = settings.allow_private_networks;
         let client = reqwest::Client::builder()
             .no_proxy()
             .user_agent(user_agent.to_string())
@@ -132,27 +176,21 @@ impl Fetcher {
             .dns_resolver(std::sync::Arc::new(guard::GuardedResolver::new(
                 settings.allow_private_networks,
             )))
-            .redirect(reqwest::redirect::Policy::custom(
-                move |attempt| match check_redirect(
-                    attempt.url(),
-                    attempt.previous().len(),
-                    redirects,
-                    allow_private,
-                ) {
-                    Ok(()) => attempt.follow(),
-                    Err(error) => attempt.error(error),
-                },
-            ))
+            .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
-        let permits =
-            std::sync::Arc::new(tokio::sync::Semaphore::new(settings.max_concurrency.max(1)));
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            settings
+                .max_concurrency
+                .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+        ));
         let cache = cache::Cache::new(settings.cache_ttl(), settings.cache_bytes);
         Ok(Fetcher {
             settings,
             client,
             cache,
             permits,
+            crawl_hosts: Default::default(),
         })
     }
 
@@ -166,10 +204,28 @@ impl Fetcher {
     /// loop cannot spin. Textless stubs that cannot be followed fail as empty.
     /// `Page.url` retains the requested URL; `final_url` identifies the destination.
     pub async fn fetch(&self, raw: &str) -> Result<Page, FetchError> {
+        self.fetch_mode(raw, false).await
+    }
+
+    /// Retrieve navigation targets separately from readable text.
+    pub async fn fetch_with_links(&self, raw: &str) -> Result<Page, FetchError> {
+        self.fetch_mode(raw, true).await
+    }
+
+    /// One deadline includes admission, every redirect, and extraction. Cancelled
+    /// queued workers are aborted; running workers retain their concurrency slot.
+    async fn fetch_mode(&self, raw: &str, links: bool) -> Result<Page, FetchError> {
+        tokio::time::timeout(self.settings.timeout(), self.fetch_chain(raw, links))
+            .await
+            .map_err(|_| FetchError::Network("request timed out".into()))?
+    }
+
+    /// Follow HTTP and refresh hops with one guarded allowance and extraction mode.
+    async fn fetch_chain(&self, raw: &str, links: bool) -> Result<Page, FetchError> {
         let mut target = raw.to_string();
         let mut hops = 0usize;
         loop {
-            let mut fetched = self.fetch_one(&target).await?;
+            let mut fetched = self.fetch_one(&target, links, &mut hops).await?;
             fetched.url = raw.to_string();
             let Some(next) = fetched.redirect.clone() else {
                 return Ok(fetched);
@@ -193,8 +249,13 @@ impl Fetcher {
         }
     }
 
-    /// One request and extraction, with no redirect following.
-    async fn fetch_one(&self, raw: &str) -> Result<Page, FetchError> {
+    /// One guarded HTTP chain and extraction, without client-side refresh following.
+    async fn fetch_one(
+        &self,
+        raw: &str,
+        links: bool,
+        hops: &mut usize,
+    ) -> Result<Page, FetchError> {
         let parsed = url::Url::parse(raw).map_err(|_| FetchError::Scheme)?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
             return Err(FetchError::Scheme);
@@ -205,8 +266,11 @@ impl Fetcher {
         )
         .map_err(|e| FetchError::Refused(e.message()))?;
 
-        if let Some(cached) = self.cache.get(raw) {
-            return Ok(cached);
+        // Only pages without HTTP hops can be reused without hiding spent hops.
+        if !links && *hops == 0 {
+            if let Some(cached) = self.cache.get(raw) {
+                return Ok(cached);
+            }
         }
 
         let permit = self
@@ -216,12 +280,7 @@ impl Fetcher {
             .await
             .map_err(|_| FetchError::Network("fetcher is shutting down".into()))?;
 
-        let response = self
-            .client
-            .get(parsed.clone())
-            .send()
-            .await
-            .map_err(|e| FetchError::Network(classify(&e)))?;
+        let response = self.request(&parsed, hops).await?;
 
         let status = response.status();
         let final_url = response.url().to_string();
@@ -252,22 +311,35 @@ impl Fetcher {
         }
         let base = final_url.clone();
         let declared = content_type.clone();
-        let page = tokio::task::spawn_blocking(move || {
+        let mut page = BlockingWork(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             match kind {
-                Kind::Html => Ok(extract::read(&decode(&body, &declared, true), &base)),
-                Kind::Text => Ok(extract::Page::text(extract::sanitize(&decode(
-                    &body, &declared, false,
-                )))),
-                Kind::Pdf => extract::pdf(&body).map(extract::Page::text),
+                Kind::Html => {
+                    let html = decode(&body, &declared, true);
+                    let graph = if links {
+                        extract::links(&html, &base)
+                    } else {
+                        Vec::new()
+                    };
+                    Ok((extract::read(&html, &base), graph))
+                }
+                Kind::Text => Ok((
+                    extract::Page::text(extract::sanitize(&decode(&body, &declared, false))),
+                    Vec::new(),
+                )),
+                Kind::Pdf => {
+                    extract::pdf(&body).map(|text| (extract::Page::text(text), Vec::new()))
+                }
             }
-        });
-        let page = tokio::time::timeout(self.settings.timeout(), page)
+        }));
+        let (page, graph) = tokio::time::timeout(self.settings.timeout(), &mut page.0)
             .await
             .map_err(|_| FetchError::Network("extraction timed out".into()))?
             .map_err(|_| FetchError::Network("extraction failed".into()))?
             .map_err(FetchError::Unsupported)?;
-        if page.text.trim().is_empty() {
+        // A textless page that names a redirect target is not empty: the caller
+        // re-guards and follows it. Only a textless page with nowhere to go is.
+        if page.text.trim().is_empty() && page.redirect.is_none() {
             return Err(FetchError::Empty);
         }
         let text = page.text;
@@ -284,12 +356,276 @@ impl Fetcher {
             published: page.published,
             site: page.site,
             text,
+            links: graph,
             truncated: Some(truncated).filter(|t| *t),
             redirect: page.redirect,
             error: None,
         };
-        self.cache.put(raw, &fetched);
+        if !links && *hops == 0 {
+            self.cache.put(raw, &fetched);
+        }
         Ok(fetched)
+    }
+
+    /// Send through the guarded transport, spending the caller's shared HTTP/refresh
+    /// allowance before dialing each redirect destination.
+    async fn request(
+        &self,
+        url: &url::Url,
+        hops: &mut usize,
+    ) -> Result<reqwest::Response, FetchError> {
+        let started = std::time::Instant::now();
+        let mut target = url.clone();
+        loop {
+            check_redirect(
+                &target,
+                *hops,
+                self.settings.max_redirects,
+                self.settings.allow_private_networks,
+            )
+            .map_err(FetchError::Refused)?;
+            let remaining = self.settings.timeout().saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(FetchError::Network("request timed out".into()));
+            }
+            let response = self
+                .client
+                .get(target.clone())
+                .timeout(remaining)
+                .send()
+                .await
+                .map_err(|error| FetchError::Network(classify(&error)))?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Ok(response);
+            };
+            if *hops >= self.settings.max_redirects {
+                return Err(FetchError::Refused("too many redirects".into()));
+            }
+            *hops += 1;
+            target = target
+                .join(
+                    location
+                        .to_str()
+                        .map_err(|_| FetchError::Refused("invalid redirect".into()))?,
+                )
+                .map_err(|_| FetchError::Refused("invalid redirect".into()))?;
+        }
+    }
+
+    /// One bounded crawl hop. Redirects are returned to the crawl scheduler so scope,
+    /// robots, delay, byte accounting and the global deadline apply to every request.
+    pub(crate) async fn crawl_response(
+        &self,
+        url: &url::Url,
+        max: u64,
+        charged: &mut u64,
+        settings: &crate::core::config::CrawlSettings,
+        delay: Duration,
+        deadline: tokio::time::Instant,
+    ) -> Result<RawPage, FetchError> {
+        check_redirect(
+            url,
+            0,
+            self.settings.max_redirects,
+            self.settings.allow_private_networks,
+        )
+        .map_err(FetchError::Refused)?;
+        let schedule = {
+            let mut hosts = self.crawl_hosts.lock().await;
+            hosts.retain(|_, host| {
+                std::sync::Arc::strong_count(&host.schedule) > 1
+                    || host.touched.elapsed() < Duration::from_millis(settings.host_ttl)
+                    || host.schedule.try_lock().is_ok_and(|schedule| {
+                        schedule
+                            .last
+                            .is_some_and(|last| last.elapsed() < schedule.delay)
+                    })
+            });
+            let key = url.host_str().unwrap_or_default().to_ascii_lowercase();
+            if !hosts.contains_key(&key) && hosts.len() >= settings.max_hosts {
+                let oldest = hosts
+                    .iter()
+                    .filter(|(_, host)| {
+                        std::sync::Arc::strong_count(&host.schedule) == 1
+                            && host.schedule.try_lock().is_ok_and(|schedule| {
+                                schedule
+                                    .last
+                                    .is_none_or(|last| last.elapsed() >= schedule.delay)
+                            })
+                    })
+                    .min_by_key(|(_, host)| host.touched)
+                    .map(|(key, _)| key.clone());
+                if let Some(oldest) = oldest {
+                    hosts.remove(&oldest);
+                }
+            }
+            if !hosts.contains_key(&key) && hosts.len() >= settings.max_hosts {
+                return Err(FetchError::Network(
+                    "crawl host scheduling capacity reached".into(),
+                ));
+            }
+            let host = hosts.entry(key).or_insert_with(|| CrawlHost {
+                touched: std::time::Instant::now(),
+                schedule: Default::default(),
+            });
+            host.touched = std::time::Instant::now();
+            host.schedule.clone()
+        };
+        let mut slot = CrawlSlot {
+            schedule: schedule.lock().await,
+            started: false,
+        };
+        let wait = slot
+            .schedule
+            .last
+            .map(|last| {
+                slot.schedule
+                    .delay
+                    .max(delay)
+                    .saturating_sub(last.elapsed())
+            })
+            .unwrap_or_default();
+        tokio::time::sleep(wait).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FetchError::Network("crawl deadline reached".into()));
+        }
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| FetchError::Network("fetcher is shutting down".into()))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FetchError::Network("crawl deadline reached".into()));
+        }
+        slot.schedule.delay = delay;
+        slot.started = true;
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|error| FetchError::Network(classify(&error)))?;
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let (body, truncated) = read_counted(
+            response,
+            max.min(self.settings.max_response_bytes),
+            charged,
+            true,
+        )
+        .await
+        .map_err(FetchError::Network)?;
+        Ok(RawPage {
+            status,
+            location,
+            content_type,
+            body,
+            truncated,
+        })
+    }
+
+    /// Extract already-budgeted crawl bytes without additional network work.
+    pub(crate) async fn crawl_page(
+        &self,
+        url: &url::Url,
+        raw: RawPage,
+        remaining: Duration,
+    ) -> Result<Page, FetchError> {
+        let url = url.clone();
+        self.crawl_work(remaining, move || Self::extract_crawl(&url, raw))
+            .await?
+    }
+
+    /// Bound parsing, extraction and evidence selection by the remaining deadline and concurrency
+    /// slot. A cancelled blocking worker retains its slot until it actually ends.
+    pub(crate) async fn crawl_work<T, F>(
+        &self,
+        remaining: Duration,
+        work: F,
+    ) -> Result<T, FetchError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permits = self.permits.clone();
+        tokio::time::timeout(remaining, async move {
+            let permit = permits
+                .acquire_owned()
+                .await
+                .map_err(|_| FetchError::Network("fetcher is shutting down".into()))?;
+            let mut task = BlockingWork(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                work()
+            }));
+            (&mut task.0)
+                .await
+                .map_err(|_| FetchError::Network("crawl parsing failed".into()))
+        })
+        .await
+        .map_err(|_| FetchError::Network("crawl parsing timed out".into()))?
+    }
+
+    /// Convert a bounded wire response on a blocking worker; no transport access.
+    fn extract_crawl(url: &url::Url, raw: RawPage) -> Result<Page, FetchError> {
+        let kind = body_kind(&raw.content_type, &raw.body)?;
+        let (page, links) = match kind {
+            Kind::Html => {
+                let html = decode(&raw.body, &raw.content_type, true);
+                (
+                    extract::read(&html, url.as_str()),
+                    extract::links(&html, url.as_str()),
+                )
+            }
+            Kind::Text => (
+                extract::Page::text(extract::sanitize(&decode(
+                    &raw.body,
+                    &raw.content_type,
+                    false,
+                ))),
+                Vec::new(),
+            ),
+            Kind::Pdf if raw.truncated => {
+                return Err(FetchError::Unsupported("truncated PDF".into()))
+            }
+            Kind::Pdf => (
+                extract::Page::text(extract::pdf(&raw.body).map_err(FetchError::Unsupported)?),
+                Vec::new(),
+            ),
+        };
+        Ok(Page {
+            url: url.to_string(),
+            fetched_at: Some(now_unix()),
+            final_url: Some(url.to_string()),
+            status: raw.status,
+            content_type: raw.content_type,
+            title: Some(page.title).filter(|t| !t.is_empty()),
+            byline: page.byline,
+            published: page.published,
+            site: page.site,
+            text: page.text,
+            links,
+            truncated: raw.truncated.then_some(true),
+            redirect: page.redirect,
+            error: None,
+        })
+    }
+
+    /// The configured total redirect allowance, including client-side refreshes.
+    pub(crate) fn redirect_limit(&self) -> usize {
+        self.settings.max_redirects
     }
 
     /// Fetch URLs concurrently, preserving input order.
@@ -315,6 +651,7 @@ impl Fetcher {
                     published: None,
                     site: None,
                     text: String::new(),
+                    links: Vec::new(),
                     truncated: None,
                     redirect: None,
                     error: Some(error.message()),
@@ -324,9 +661,28 @@ impl Fetcher {
     }
 }
 
+/// Navigation excludes common image destinations even when represented by text anchors.
+pub(crate) fn navigation_target(url: &url::Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    ![
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".avif", ".bmp", ".tif", ".tiff",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
+}
+
+/// A bounded wire response used only by the crawl scheduler.
+pub(crate) struct RawPage {
+    pub status: u16,
+    pub location: Option<String>,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// Validate HTTP redirects before reqwest can dial a literal address or hostname.
-/// `hops` counts every URL visited so far, including the initial one, so the
-/// budget allows exactly `maximum` redirects: hop `maximum + 1` is refused.
+/// `hops` counts redirects from the initial URL, so the budget allows exactly
+/// `maximum` redirects: hop `maximum + 1` is refused.
 fn check_redirect(
     url: &url::Url,
     hops: usize,
@@ -347,18 +703,51 @@ fn check_redirect(
 /// The bytes are returned undecoded: the charset and content kind decide how
 /// they become text.
 async fn read_capped(response: reqwest::Response, max: u64) -> Result<(Vec<u8>, bool), String> {
+    read_counted(response, max, &mut 0, false).await
+}
+
+/// Charge retained bytes as they arrive, including reads cancelled by the crawl
+/// deadline. At the cap, an uncompressed Content-Length proves completion;
+/// unknown framing remains conservative without polling an extra hidden chunk.
+async fn read_counted(
+    response: reqwest::Response,
+    max: u64,
+    charged: &mut u64,
+    stop_at_cap: bool,
+) -> Result<(Vec<u8>, bool), String> {
     use futures::StreamExt;
+    let known_length = if !response
+        .headers()
+        .contains_key(reqwest::header::CONTENT_ENCODING)
+        && !response
+            .headers()
+            .contains_key(reqwest::header::TRANSFER_ENCODING)
+    {
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|length| length.to_str().ok())
+            .and_then(|length| length.parse::<u64>().ok())
+    } else {
+        None
+    };
     let mut stream = response.bytes_stream();
     let mut collected: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("body failed: {e}"))?;
+        let chunk = chunk.map_err(|error| format!("body failed: {}", classify(&error)))?;
         let remaining = max.saturating_sub(collected.len() as u64);
         if chunk.len() as u64 > remaining {
             let take = remaining as usize;
             collected.extend_from_slice(chunk.get(..take).unwrap_or(&chunk));
+            *charged = charged.saturating_add(take as u64);
             return Ok((collected, true));
         }
         collected.extend_from_slice(&chunk);
+        *charged = charged.saturating_add(chunk.len() as u64);
+        if stop_at_cap && collected.len() as u64 >= max {
+            let complete = known_length == Some(collected.len() as u64);
+            return Ok((collected, !complete));
+        }
     }
     Ok((collected, false))
 }
@@ -527,6 +916,234 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
 
+    /// Saturated fetch/extraction admission cannot keep a read waiting beyond
+    /// its configured deadline, even before any network request can start.
+    #[tokio::test]
+    async fn fetch_deadline_includes_admission_wait() {
+        let fetcher = Fetcher::new(
+            FetchSettings {
+                timeout: 20,
+                max_concurrency: 1,
+                allow_private_networks: true,
+                ..Default::default()
+            },
+            "search-test",
+        )
+        .unwrap();
+        let permit = fetcher.permits.acquire().await.unwrap();
+        for links in [false, true] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetcher.fetch_mode("http://127.0.0.1:1/unreachable", links),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.message(), "request timed out");
+        }
+        assert_eq!(fetcher.permits.available_permits(), 0);
+        drop(permit);
+        assert_eq!(fetcher.permits.available_permits(), 1);
+    }
+
+    /// Cancellation of an in-flight response preserves a fresh completion time.
+    #[tokio::test]
+    async fn cancelled_crawl_response_records_completion() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                .await
+                .unwrap();
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let fetcher = local_fetcher(100);
+        let settings = Default::default();
+        let mut bytes = 0;
+        let delay = Duration::from_secs(1);
+        let mut request = Box::pin(fetcher.crawl_response(
+            &url,
+            100,
+            &mut bytes,
+            &settings,
+            delay,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ));
+        tokio::select! {
+            _ = received => {},
+            _ = &mut request => panic!("fixture response must remain incomplete"),
+        }
+        let cancelled = std::time::Instant::now();
+        drop(request);
+        let hosts = fetcher.crawl_hosts.lock().await;
+        let schedule = hosts.get("127.0.0.1").unwrap().schedule.lock().await;
+        assert!(schedule.last.unwrap() >= cancelled);
+        assert_eq!(schedule.delay, delay);
+        assert_eq!(
+            fetcher.permits.available_permits(),
+            fetcher.settings.max_concurrency
+        );
+        server.abort();
+    }
+
+    /// A delay belongs to the last request; a later crawl can lower it after
+    /// honoring that request's outstanding wait.
+    #[tokio::test]
+    async fn crawl_delay_does_not_permanently_poison_host_schedule() {
+        let port = serve(vec![("/", "text/plain", b"ok".to_vec())]).await;
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let fetcher = local_fetcher(100);
+        let settings = Default::default();
+        let mut bytes = 0;
+        let delay = Duration::from_millis(20);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        fetcher
+            .crawl_response(&url, 100, &mut bytes, &settings, delay, deadline)
+            .await
+            .unwrap();
+        fetcher
+            .crawl_response(&url, 100, &mut bytes, &settings, Duration::ZERO, deadline)
+            .await
+            .unwrap();
+        let hosts = fetcher.crawl_hosts.lock().await;
+        assert_eq!(
+            hosts.get("127.0.0.1").unwrap().schedule.lock().await.delay,
+            Duration::ZERO
+        );
+    }
+
+    /// Dropping a queued blocking worker prevents execution and releases its permit.
+    #[test]
+    fn cancelled_queued_blocking_work_never_runs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel();
+        let (ready, started) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        started.recv().unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.block_on(async {
+            let fetcher = local_fetcher(100);
+            let observed = ran.clone();
+            let result = fetcher
+                .crawl_work(Duration::from_millis(10), move || {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await;
+            assert!(result.is_err());
+        });
+        release.send(()).unwrap();
+        runtime.block_on(blocker).unwrap();
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Separate concurrent crawl calls share host spacing instead of each
+    /// applying an independent delay and doubling requests to the same host.
+    #[tokio::test]
+    async fn concurrent_crawl_calls_share_host_politeness() {
+        let port = serve(vec![
+            ("/a", "text/plain", b"first".to_vec()),
+            ("/b", "text/plain", b"second".to_vec()),
+        ])
+        .await;
+        let fetcher = local_fetcher(DEFAULT_TEST_BYTES);
+        let first = url::Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap();
+        let second = url::Url::parse(&format!("http://127.0.0.1:{port}/b")).unwrap();
+        let settings = crate::core::config::CrawlSettings::default();
+        let delay = Duration::from_millis(30);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut first_bytes = 0;
+        fetcher
+            .crawl_response(&first, 100, &mut first_bytes, &settings, delay, deadline)
+            .await
+            .unwrap();
+        let schedule = fetcher
+            .crawl_hosts
+            .lock()
+            .await
+            .get("127.0.0.1")
+            .unwrap()
+            .schedule
+            .clone();
+        let first_completed = schedule.lock().await.last.unwrap();
+        let mut left_bytes = 0;
+        let mut right_bytes = 0;
+        let (left, right) = tokio::join!(
+            fetcher.crawl_response(&first, 100, &mut left_bytes, &settings, delay, deadline),
+            fetcher.crawl_response(&second, 100, &mut right_bytes, &settings, delay, deadline)
+        );
+        left.unwrap();
+        right.unwrap();
+        assert!(
+            schedule
+                .lock()
+                .await
+                .last
+                .unwrap()
+                .duration_since(first_completed)
+                >= delay * 2
+        );
+        assert_eq!(fetcher.crawl_hosts.lock().await.len(), 1);
+    }
+
+    /// A bounded scheduler never forgets an outstanding host delay merely to
+    /// admit another host; idle safe records remain evictable without growth.
+    #[tokio::test]
+    async fn host_capacity_cannot_evict_required_politeness() {
+        let port = serve(vec![("/", "text/plain", b"ok".to_vec())]).await;
+        let fetcher = local_fetcher(DEFAULT_TEST_BYTES);
+        let first = url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let other = url::Url::parse(&format!("http://localhost:{port}/")).unwrap();
+        let settings = crate::core::config::CrawlSettings {
+            max_hosts: 1,
+            ..Default::default()
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut bytes = 0;
+        fetcher
+            .crawl_response(
+                &first,
+                100,
+                &mut bytes,
+                &settings,
+                Duration::from_secs(3600),
+                deadline,
+            )
+            .await
+            .unwrap();
+        let error = fetcher
+            .crawl_response(&other, 100, &mut bytes, &settings, Duration::ZERO, deadline)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.message(), "crawl host scheduling capacity reached");
+        {
+            let hosts = fetcher.crawl_hosts.lock().await;
+            hosts.get("127.0.0.1").unwrap().schedule.lock().await.delay = Duration::ZERO;
+        }
+        fetcher
+            .crawl_response(&other, 100, &mut bytes, &settings, Duration::ZERO, deadline)
+            .await
+            .unwrap();
+        let hosts = fetcher.crawl_hosts.lock().await;
+        assert_eq!(hosts.len(), 1);
+        assert!(hosts.contains_key("localhost"));
+    }
+
     #[test]
     fn http_redirects_cannot_bypass_the_guard_with_literal_addresses() {
         for target in [
@@ -692,6 +1309,44 @@ mod tests {
             .fetch(&format!("http://127.0.0.1:{port}/hop1"))
             .await
             .is_err());
+    }
+
+    /// A page that is only a prompt redirect is followed even when it shows no
+    /// text; a textless page with nowhere to go is still an empty error.
+    #[tokio::test]
+    async fn a_textless_meta_refresh_is_followed() {
+        let port = serve(vec![
+            (
+                "/stub",
+                "text/html",
+                b"<meta http-equiv=\"refresh\" content=\"0; url=/end\">".to_vec(),
+            ),
+            ("/end", "text/plain", b"final".to_vec()),
+        ])
+        .await;
+        let page = local_fetcher(DEFAULT_TEST_BYTES)
+            .fetch(&format!("http://127.0.0.1:{port}/stub"))
+            .await
+            .expect("a textless stub with a target is followed");
+        assert_eq!(page.text, "final");
+        assert_eq!(page.url, format!("http://127.0.0.1:{port}/stub"));
+
+        // With no hop budget the stub cannot be followed, so it is empty.
+        let fetcher = Fetcher::new(
+            FetchSettings {
+                allow_private_networks: true,
+                max_redirects: 0,
+                ..FetchSettings::default()
+            },
+            "search-test",
+        )
+        .expect("valid test client");
+        assert!(matches!(
+            fetcher
+                .fetch(&format!("http://127.0.0.1:{port}/stub"))
+                .await,
+            Err(FetchError::Empty)
+        ));
     }
 
     /// A failed HTTP response keeps its status in the per-URL result, so a machine can
@@ -930,5 +1585,130 @@ mod tests {
             .bytes(),
         );
         pdf
+    }
+
+    /// Mixed HTTP and meta redirects spend one allowance, including subsequent
+    /// HTTP chains; repeated calls must not bypass the limit through cached stubs.
+    #[tokio::test]
+    async fn ordinary_fetch_shares_http_and_meta_redirect_allowance() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = hits.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut bytes = [0; 8192];
+                let count = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let path = request.split_whitespace().nth(1).unwrap().to_string();
+                recorded.lock().unwrap().push(path.clone());
+                let (status, headers, body) = match path.as_str() {
+                    "/a" => (302, "Location: /b\r\n", ""),
+                    "/b" => (
+                        200,
+                        "Content-Type: text/html\r\n",
+                        "<meta http-equiv='refresh' content='0; url=/c'>",
+                    ),
+                    "/c" => (302, "Location: /d\r\n", ""),
+                    "/d" => (200, "Content-Type: text/plain\r\n", "Final"),
+                    _ => (404, "", ""),
+                };
+                let wire = format!("HTTP/1.1 {status} fixture\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len());
+                let _ = socket.write_all(wire.as_bytes()).await;
+            }
+        });
+        let settings = |limit| FetchSettings {
+            allow_private_networks: true,
+            max_redirects: limit,
+            ..Default::default()
+        };
+        for (limit, paths) in [
+            (1, vec!["/a", "/b"]),
+            (2, vec!["/a", "/b", "/c"]),
+            (3, vec!["/a", "/b", "/c", "/d"]),
+        ] {
+            let fetcher = Fetcher::new(settings(limit), "Search/1").unwrap();
+            for _ in 0..2 {
+                hits.lock().unwrap().clear();
+                let fetched = fetcher.fetch(&format!("{base}/a")).await;
+                assert_eq!(hits.lock().unwrap().as_slice(), paths);
+                if limit == 3 {
+                    assert_eq!(fetched.unwrap().text, "Final");
+                } else {
+                    assert!(fetched.is_err());
+                }
+            }
+        }
+        task.abort();
+    }
+
+    /// Uncompressed framing proves that an exact-cap PDF is complete and extractable.
+    #[tokio::test]
+    async fn crawl_pdf_exactly_at_content_length_cap_remains_readable() {
+        let pdf = minimal_pdf("A complete exact-cap document");
+        let size = pdf.len() as u64;
+        let port = serve(vec![("/paper.pdf", "application/pdf", pdf)]).await;
+        let fetcher = local_fetcher(size);
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/paper.pdf")).unwrap();
+        let mut bytes = 0;
+        let raw = fetcher
+            .crawl_response(
+                &url,
+                size,
+                &mut bytes,
+                &Default::default(),
+                Duration::ZERO,
+                tokio::time::Instant::now() + Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        assert!(!raw.truncated);
+        assert_eq!(bytes, size);
+        let page = fetcher
+            .crawl_page(&url, raw, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(page.text.contains("A complete exact-cap document"));
+        assert_eq!(page.truncated, None);
+    }
+
+    /// An unknown body at the cap stops immediately rather than waiting for its
+    /// next chunk or EOF. Conservative truncation does not trigger extra reads.
+    #[tokio::test]
+    async fn unknown_length_at_cap_stops_without_reading_excess() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nText\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut bytes = 0;
+        let fetcher = local_fetcher(4);
+        let raw = tokio::time::timeout(
+            Duration::from_secs(1),
+            fetcher.crawl_response(
+                &url,
+                4,
+                &mut bytes,
+                &Default::default(),
+                Duration::ZERO,
+                tokio::time::Instant::now() + Duration::from_secs(15),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        task.abort();
+        assert_eq!(raw.body, b"Text");
+        assert_eq!(bytes, 4);
+        assert!(raw.truncated);
     }
 }

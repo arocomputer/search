@@ -48,89 +48,172 @@ pub async fn execute(command: Command) -> i32 {
             limit,
             json,
             engines,
+            filters,
             config,
-        } => search_command(query, limit, json, engines, config).await,
+        } => {
+            let filters = match crate::cli::args::query_filters(filters) {
+                Ok(filters) => filters,
+                Err(e) => return report_error(e),
+            };
+            let client = match build_client(config) {
+                Ok(client) => client,
+                Err(e) => return report_error(e),
+            };
+            match client
+                .search(crate::core::Query {
+                    text: query,
+                    limit,
+                    engines,
+                    filters,
+                })
+                .await
+            {
+                Ok(answer) if json => crate::cli::render::json(&answer),
+                Ok(answer) => crate::cli::render::search(&answer),
+                Err(e) => report_error(e),
+            }
+        }
         Command::Fetch {
             urls,
             query,
             max_characters,
             offset,
+            full,
+            links,
             json,
             config,
-        } => fetch_command(urls, query, max_characters, offset, json, config).await,
-    }
-}
-
-async fn search_command(
-    query: String,
-    limit: usize,
-    json: bool,
-    engines: Vec<String>,
-    config_path: Option<String>,
-) -> i32 {
-    let service = match build_client(config_path) {
-        Ok(service) => service,
-        Err(error) => return report_error(error),
-    };
-    let mut request = crate::core::Query {
-        text: query,
-        ..Default::default()
-    };
-    request.limit = limit;
-    if !engines.is_empty() {
-        request.engines = engines;
-    }
-    let response = match service.search(request).await {
-        Ok(response) => response,
-        Err(error) => return report_error(error),
-    };
-    if json {
-        crate::cli::render::json(&response)
-    } else {
-        crate::cli::render::search(&response)
-    }
-}
-
-/// Fetch clean pages through the selected client and render bounded excerpts.
-async fn fetch_command(
-    urls: Vec<String>,
-    query: Option<String>,
-    max_characters: Option<usize>,
-    offset: usize,
-    json: bool,
-    config_path: Option<String>,
-) -> i32 {
-    if max_characters == Some(0) {
-        return report_error("max-chars must be at least 1".into());
-    }
-    let service = match build_client(config_path) {
-        Ok(service) => service,
-        Err(error) => return report_error(error),
-    };
-    let pages = match service.fetch(&urls).await {
-        Ok(pages) => pages,
-        Err(error) => return report_error(error),
-    };
-    let reading = crate::core::text::Focus {
-        query,
-        max_characters,
-        offset,
-    };
-    let results: Vec<_> = pages
-        .into_iter()
-        .map(|page| crate::core::text::focus(page, &reading))
-        .collect();
-    let failed = results.iter().any(|read| read.page.error.is_some());
-    let rendered = if json {
-        crate::cli::render::json(&results)
-    } else {
-        crate::cli::render::fetch(&results);
-        0
-    };
-    if failed {
-        1
-    } else {
-        rendered
+        } => {
+            let client = match build_client(config) {
+                Ok(client) => client,
+                Err(e) => return report_error(e),
+            };
+            match client
+                .read(crate::client::ReadRequest {
+                    urls,
+                    query,
+                    max_characters,
+                    offset,
+                    full,
+                    links,
+                })
+                .await
+            {
+                Ok(results) => {
+                    let failed = results.iter().any(|read| read.page.error.is_some());
+                    let rendered = if json {
+                        crate::cli::render::json(&results)
+                    } else {
+                        crate::cli::render::fetch(&results);
+                        0
+                    };
+                    if failed {
+                        1
+                    } else {
+                        rendered
+                    }
+                }
+                Err(e) => report_error(e),
+            }
+        }
+        Command::Research {
+            queries,
+            sources,
+            source_characters,
+            total_characters,
+            max_per_host,
+            max_attempts,
+            timeout,
+            session,
+            filters,
+            engines,
+            synthesize,
+            rerank,
+            json,
+            config,
+        } => {
+            let filters = match crate::cli::args::query_filters(filters) {
+                Ok(filters) => filters,
+                Err(e) => return report_error(e),
+            };
+            let client = match build_client(config) {
+                Ok(client) => client,
+                Err(e) => return report_error(e),
+            };
+            let request = crate::client::ResearchRequest {
+                queries,
+                options: crate::core::ResearchOptions {
+                    sources,
+                    source_characters,
+                    total_characters,
+                    max_per_host,
+                    max_attempts,
+                    timeout,
+                    session,
+                    filters,
+                    engines,
+                },
+                synthesize,
+                rerank,
+            };
+            match client.research(request).await {
+                Ok(packet) if json => crate::cli::render::json(&packet),
+                Ok(packet) => crate::cli::render::research(&packet),
+                Err(e) => report_error(e),
+            }
+        }
+        Command::Crawl {
+            url,
+            max_pages,
+            max_depth,
+            max_bytes,
+            timeout,
+            path_prefix,
+            max_characters,
+            total_characters,
+            full,
+            map,
+            json,
+            config,
+        } => {
+            let client = match build_client(config) {
+                Ok(client) => client,
+                Err(e) => return report_error(e),
+            };
+            let request = crate::core::CrawlRequest {
+                url,
+                options: crate::core::CrawlOptions {
+                    max_pages,
+                    max_depth,
+                    max_bytes,
+                    timeout,
+                    path_prefix,
+                    max_characters,
+                    total_characters,
+                    full,
+                },
+            };
+            let result = if map {
+                client.map(request).await
+            } else {
+                client.crawl(request).await
+            };
+            match result {
+                Ok(report) => {
+                    let failed = !report.failures.is_empty() || report.timed_out;
+                    let rendered = if json {
+                        crate::cli::render::json(&report)
+                    } else {
+                        crate::cli::render::crawl(&report)
+                    };
+                    if failed {
+                        1
+                    } else {
+                        rendered
+                    }
+                }
+                Err(e) => report_error(e),
+            }
+        }
     }
 }
 

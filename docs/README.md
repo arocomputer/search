@@ -20,6 +20,7 @@ stdio MCP. Hosting is optional. Use `search help` for commands and
 | Page | What it covers |
 | --- | --- |
 | [Architecture](contributing/architecture.md) | The single package, modules, features, and layering rules |
+| [Retrieval evaluations](contributing/evaluation.md) | Labeled useful-evidence contracts and honest live/replay metrics |
 | [Releases](contributing/releases.md) | Cutting a release and what the tag runs |
 
 [AGENTS.md](../AGENTS.md) is the short map for an agent editing the repository;

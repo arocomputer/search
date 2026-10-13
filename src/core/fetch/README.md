@@ -30,8 +30,15 @@ bound. Text is never truncated during extraction: the byte bound limits work,
 and `core::text::focus` applies a reader's query, character window and offset.
 
 Bodies are decoded under the configured byte cap; extraction runs off the async
-executor. Preserve literal text such as `values[index]` while neutralizing
-Markdown link/image targets in HTML and non-HTML responses. Filtering is
+executor. One page-read deadline includes admission, all redirects, and extraction.
+Cancelling a wait aborts queued extraction; already running blocking
+parsers retain their concurrency permit until they finish. Crawl host schedules
+record completion on success, failure and cancellation, and honor the previous
+request's delay before applying the next request's delay.
+
+Preserve literal text such as `values[index]` while neutralizing Markdown images
+across line breaks and reference definitions in HTML and non-HTML responses.
+Article metadata receives the same literal-text safety treatment as body text. Filtering is
 defense in depth, not a guarantee against prompt injection: consumers must
 treat extracted text as source data, not instructions.
 

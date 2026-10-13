@@ -7,10 +7,17 @@
 //! answer is never mistaken for a broken one.
 
 mod adapter;
+mod cache;
 mod pool;
 mod scratch;
 
+pub(crate) use pool::fuse_answers;
 pub use pool::Pool;
+
+/// Apply the command-engine filesystem contract to optional edge processors.
+pub(crate) fn prepare_command_scratch(path: &std::path::Path) -> Result<(), String> {
+    scratch::prepare(path)
+}
 
 use crate::core::Link;
 
@@ -24,6 +31,9 @@ pub struct EngineState {
     /// Upstream rows dropped as invalid (empty title, unusable URL, bad snippet).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped: usize,
+    /// Requested filters this engine cannot honor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_filters: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub elapsed_ms: u64,
@@ -44,11 +54,14 @@ pub enum EngineStatus {
 }
 
 /// One engine's answer: valid links in upstream rank order, and how many
-/// upstream rows were skipped as invalid before the limit was reached.
+/// upstream rows were skipped as invalid before the limit was reached. Commands
+/// can also report unsupported constraints; only requested field names reach callers.
 #[derive(Debug, Default)]
 pub struct Found {
     pub links: Vec<Link>,
     pub skipped: usize,
+    /// Optional command v2 capability report; the pool retains only requested names.
+    pub unsupported_filters: Vec<String>,
 }
 
 /// A link paired with its engine rank for reciprocal-rank fusion.
@@ -74,6 +87,16 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Run one query. Results are in the engine's own ranking order.
     fn search(&self, query: String, limit: usize) -> EngineFuture;
+
+    /// Filter-aware entry point; legacy implementations report all constraints unsupported.
+    fn search_query(&self, query: crate::core::Query, limit: usize) -> EngineFuture {
+        self.search(query.text, limit)
+    }
+
+    /// Constraints not implemented by this transport, including on failure.
+    fn unsupported_filters(&self, filters: &crate::core::service::QueryFilters) -> Vec<String> {
+        filters.values().into_keys().collect()
+    }
 }
 
 /// An engine failure, classified so the pool can report it without

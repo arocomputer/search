@@ -51,6 +51,11 @@ fn entry_bytes(key: &str, page: &Page) -> usize {
     .fold(std::mem::size_of::<(String, Entry)>(), |bytes, text| {
         bytes.saturating_add(text.len())
     })
+    .saturating_add(page.links.iter().fold(0usize, |bytes, link| {
+        bytes
+            .saturating_add(std::mem::size_of::<String>())
+            .saturating_add(link.len())
+    }))
 }
 
 impl Cache {
@@ -126,6 +131,7 @@ mod tests {
             published: None,
             site: None,
             text: "body".into(),
+            links: Vec::new(),
             truncated: None,
             redirect: None,
             error: None,

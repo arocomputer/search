@@ -84,6 +84,11 @@ grep -q 'Policy::none()' "$adapters" || bad "custom HTTP adapters may follow red
 grep -q 'no_proxy()' "$adapters" || bad "custom HTTP adapters may use environment proxies"
 grep -q 'kill_on_drop(true)' "$adapters" || bad "cancelled executable adapters may keep running"
 grep -q 'env_clear()' "$adapters" || bad "executable engines inherit undeclared host credentials"
+processors=src/client/processing.rs
+[ -f "$processors" ] || bad "optional packet processor implementation is missing"
+grep -q 'kill_on_drop(true)' "$processors" || bad "cancelled packet processors may keep running"
+grep -q 'env_clear()' "$processors" || bad "packet processors inherit undeclared host credentials"
+grep -q 'prepare_command_scratch' "$processors" || bad "packet processors skip private scratch validation"
 [ ! -d src/core/engines/mwmbl ] && [ ! -d src/core/engines/searxng ] || bad "built-in engines must be adapter presets, not special implementations"
 
 # 5. Paired HTTPS must wrap execution routes, including MCP. Pairing is the

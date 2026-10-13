@@ -29,6 +29,7 @@ pub enum Command {
     /// Search the web, printing results for a person or JSON for a script.
     Search {
         query: String,
+        filters: Vec<(String, String)>,
         /// Zero lets the selected service use its configured result maximum.
         limit: usize,
         json: bool,
@@ -42,6 +43,41 @@ pub enum Command {
         max_characters: Option<usize>,
         /// Character to start reading at, from an earlier continuation.
         offset: usize,
+        full: bool,
+        links: bool,
+        json: bool,
+        config: Option<String>,
+    },
+    /// Research one or more intents into a bounded, cited evidence packet.
+    Research {
+        queries: Vec<String>,
+        filters: Vec<(String, String)>,
+        max_per_host: usize,
+        max_attempts: usize,
+        timeout: u64,
+        session: Option<String>,
+        synthesize: bool,
+        rerank: bool,
+        /// Zero uses the configured default, as `-limit` does.
+        sources: usize,
+        source_characters: usize,
+        total_characters: usize,
+        engines: Vec<String>,
+        json: bool,
+        config: Option<String>,
+    },
+    /// Crawl or map a bounded same-origin site.
+    Crawl {
+        url: String,
+        max_pages: usize,
+        max_depth: usize,
+        max_bytes: u64,
+        timeout: u64,
+        path_prefix: Option<String>,
+        max_characters: usize,
+        total_characters: usize,
+        full: bool,
+        map: bool,
         json: bool,
         config: Option<String>,
     },
@@ -99,9 +135,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 hostname: flags.hostname,
             })
         }
-        Some("fetch") => {
+        Some("fetch" | "read") => {
             let _ = args.next();
             parse_fetch(args)
+        }
+        Some("crawl" | "map") => {
+            let map = args.next().as_deref() == Some("map");
+            parse_crawl(args, map)
+        }
+        Some("research") => {
+            let _ = args.next();
+            parse_research(args)
         }
         Some("engines") => {
             let _ = args.next();
@@ -189,11 +233,38 @@ Search flags:
 
 Fetch flags:
   -query TEXT                    relevant passages; fall back to text if none match
-  -max-chars N                    per-page character limit (default: whole page)
+  -max-chars N                    per-page character window (default from settings)
   -offset N                       continue reading at character N
   -json                          print JSON instead of text
-  Without query or character limit, return the full clean page.
-  Focused reads default to 6000 characters per page.
+  -full                          explicitly read the full clean page
+  -links                         include discovered public links
+  read is an alias for fetch; default windows use research.read_characters.
+
+Directional filters (search and research):
+  -freshness TEXT  -start-date YYYY-MM-DD  -end-date YYYY-MM-DD
+  -include-domains A,B  -exclude-domains A,B  -language TEXT  -region TEXT
+  -category TEXT  -safe true|false  -exact-phrase TEXT
+
+Research flags:
+  search research QUERY [-query MORE]...
+                                  search, read, and return a bounded, cited
+                                  packet of dated passages in one call
+  -sources N                      distinct sources to read (default 5, maximum 10)
+  -chars N                        passage characters per source (default 4000)
+  -total-chars N                  passage characters in the packet (default 12000)
+  -engines A,B                    restrict to selected engine IDs
+  -json                           print JSON instead of text
+
+  -max-per-host N  -max-attempts N  -timeout MS
+  -session ID                     skip useful evidence already seen in this session
+  -synthesize  -rerank             opt in to configured processing commands
+
+Crawl/map flags:
+  search crawl URL | search map URL
+  -max-pages N  -max-depth N  -max-bytes N  -timeout MS  -path-prefix PATH
+  -max-chars N  -total-chars N      bounded page/collection text windows
+  -full                           explicitly return full crawled page text
+  -json                           print the bounded report as JSON
 
 Settings:
   -config PATH                    settings file; before or after the command/query
@@ -257,6 +328,8 @@ impl Command {
             | Command::Serve { config, .. }
             | Command::Search { config, .. }
             | Command::Fetch { config, .. }
+            | Command::Research { config, .. }
+            | Command::Crawl { config, .. }
             | Command::Remote { config, .. } => Some(config),
             Command::Version | Command::Help => None,
         }
@@ -277,11 +350,13 @@ fn parse_config_flag<I: IntoIterator<Item = String>>(args: I) -> Result<Option<S
     Ok(config)
 }
 
+/// Parse a query, engine selection and directional filters without resolving host defaults.
 fn parse_search<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
     let mut query_words = Vec::new();
     let mut limit = 0usize;
     let mut json = false;
     let mut engines = Vec::new();
+    let mut filters = Vec::new();
     let mut config = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -309,6 +384,12 @@ fn parse_search<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Stri
             "-config" | "--config" => {
                 config = Some(args.next().ok_or("missing value for -config")?)
             }
+            flag if is_filter_flag(flag) => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                filters.push((flag.trim_start_matches('-').to_string(), value));
+            }
             other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
             word => query_words.push(word.to_string()),
         }
@@ -321,15 +402,19 @@ fn parse_search<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Stri
         limit,
         json,
         engines,
+        filters,
         config,
     })
 }
 
+/// Parse bounded reading and explicit full/link opt-ins.
 fn parse_fetch<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
     let mut urls = Vec::new();
     let mut query = None;
     let mut max_characters = None;
     let mut offset = 0;
+    let mut full = false;
+    let mut links = false;
     let mut json = false;
     let mut config = None;
     let mut args = args.into_iter();
@@ -351,6 +436,12 @@ fn parse_fetch<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Strin
                     .parse()
                     .map_err(|_| "-offset needs a number".to_string())?;
             }
+            "-full" | "--full" => full = true,
+            "-links" | "--links" => links = true,
+            "--" => {
+                urls.extend(args);
+                break;
+            }
             "-json" | "--json" => json = true,
             "-config" | "--config" => {
                 config = Some(args.next().ok_or("missing value for -config")?)
@@ -367,6 +458,207 @@ fn parse_fetch<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Strin
         query,
         max_characters,
         offset,
+        full,
+        links,
+        json,
+        config,
+    })
+}
+
+/// Parse research intents, bounds, session and optional processing controls.
+fn parse_research<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
+    let mut words = Vec::new();
+    let mut queries = Vec::new();
+    let mut sources = 0usize;
+    let mut source_characters = 0usize;
+    let mut total_characters = 0usize;
+    let mut engines = Vec::new();
+    let mut filters = Vec::new();
+    let mut json = false;
+    let mut config = None;
+    let mut max_per_host = 0;
+    let mut max_attempts = 0;
+    let mut timeout = 0;
+    let mut session = None;
+    let mut synthesize = false;
+    let mut rerank = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => {
+                words.extend(args);
+                break;
+            }
+            "-query" | "--query" => queries.push(args.next().ok_or("missing value for -query")?),
+            "-sources" | "--sources" => {
+                sources = args
+                    .next()
+                    .ok_or("missing value for -sources")?
+                    .parse()
+                    .map_err(|_| "-sources needs a number".to_string())?;
+            }
+            "-chars" | "--chars" => {
+                source_characters = args
+                    .next()
+                    .ok_or("missing value for -chars")?
+                    .parse()
+                    .map_err(|_| "-chars needs a number".to_string())?;
+            }
+            "-total-chars" | "--total-chars" => {
+                total_characters = args
+                    .next()
+                    .ok_or("missing value for -total-chars")?
+                    .parse()
+                    .map_err(|_| "-total-chars needs a number".to_string())?;
+            }
+            "-engines" | "--engines" => {
+                let value = args.next().ok_or("missing value for -engines")?;
+                engines = value
+                    .split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect();
+            }
+            "-max-per-host" | "--max-per-host" => max_per_host = number(&mut args, "max-per-host")?,
+            "-max-attempts" | "--max-attempts" => max_attempts = number(&mut args, "max-attempts")?,
+            "-timeout" | "--timeout" => timeout = number(&mut args, "timeout")?,
+            "-session" | "--session" => {
+                session = Some(args.next().ok_or("missing value for -session")?)
+            }
+            "-synthesize" | "--synthesize" => synthesize = true,
+            "-rerank" | "--rerank" => rerank = true,
+            "-json" | "--json" => json = true,
+            "-config" | "--config" => {
+                config = Some(args.next().ok_or("missing value for -config")?)
+            }
+            flag if is_filter_flag(flag) => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                filters.push((flag.trim_start_matches('-').to_string(), value));
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other:?}")),
+            word => words.push(word.to_string()),
+        }
+    }
+    // Positional words are the first intent; `-query` adds more.
+    if !words.is_empty() {
+        queries.insert(0, words.join(" "));
+    }
+    if queries.is_empty() {
+        return Err("research needs a query".into());
+    }
+    Ok(Command::Research {
+        queries,
+        sources,
+        source_characters,
+        total_characters,
+        engines,
+        filters,
+        max_per_host,
+        max_attempts,
+        timeout,
+        session,
+        synthesize,
+        rerank,
+        json,
+        config,
+    })
+}
+
+/// Read a numeric flag value with a useful error.
+fn number<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<T, String> {
+    args.next()
+        .ok_or_else(|| format!("missing value for -{flag}"))?
+        .parse()
+        .map_err(|_| format!("-{flag} needs a number"))
+}
+
+/// Recognize directional filters shared by search and research.
+fn is_filter_flag(flag: &str) -> bool {
+    flag.starts_with('-')
+        && matches!(
+            flag.trim_start_matches('-'),
+            "freshness"
+                | "start-date"
+                | "end-date"
+                | "include-domains"
+                | "exclude-domains"
+                | "language"
+                | "region"
+                | "category"
+                | "safe"
+                | "exact-phrase"
+        )
+}
+
+/// Translate CLI spelling into the core filter shape; Client validates values.
+pub(super) fn query_filters(
+    flags: Vec<(String, String)>,
+) -> Result<crate::core::QueryFilters, String> {
+    let mut values = serde_json::Map::new();
+    for (name, value) in flags {
+        let key = name.replace('-', "_");
+        let value = match name.as_str() {
+            "include-domains" | "exclude-domains" => serde_json::json!(value
+                .split(',')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()),
+            "safe" => serde_json::json!(value
+                .parse::<bool>()
+                .map_err(|_| "-safe needs true or false")?),
+            _ => serde_json::json!(value),
+        };
+        values.insert(key, value);
+    }
+    serde_json::from_value(serde_json::Value::Object(values)).map_err(|e| e.to_string())
+}
+
+/// Parse bounded site inventory flags; zero numeric bounds defer to settings.
+fn parse_crawl(args: impl IntoIterator<Item = String>, map: bool) -> Result<Command, String> {
+    let mut args = args.into_iter();
+    let (mut url, mut path_prefix, mut config) = (None, None, None);
+    let (mut max_pages, mut max_depth, mut max_bytes, mut timeout) = (0, 0, 0, 0);
+    let mut json = false;
+    let (mut max_characters, mut total_characters, mut full) = (0, 0, false);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-max-pages" | "--max-pages" => max_pages = number(&mut args, "max-pages")?,
+            "-max-depth" | "--max-depth" => max_depth = number(&mut args, "max-depth")?,
+            "-max-bytes" | "--max-bytes" => max_bytes = number(&mut args, "max-bytes")?,
+            "-max-chars" | "--max-chars" => max_characters = number(&mut args, "max-chars")?,
+            "-total-chars" | "--total-chars" => {
+                total_characters = number(&mut args, "total-chars")?
+            }
+            "-full" | "--full" => full = true,
+            "-timeout" | "--timeout" => timeout = number(&mut args, "timeout")?,
+            "-path-prefix" | "--path-prefix" => {
+                path_prefix = Some(args.next().ok_or("missing value for -path-prefix")?)
+            }
+            "-config" | "--config" => {
+                config = Some(args.next().ok_or("missing value for -config")?)
+            }
+            "-json" | "--json" => json = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown flag {flag:?}")),
+            _ if url.is_none() => url = Some(arg),
+            _ => return Err("crawl/map accepts one root URL".into()),
+        }
+    }
+    Ok(Command::Crawl {
+        url: url.ok_or("crawl/map needs a root URL")?,
+        max_pages,
+        max_depth,
+        max_bytes,
+        timeout,
+        path_prefix,
+        max_characters,
+        total_characters,
+        full,
+        map,
         json,
         config,
     })
@@ -488,6 +780,8 @@ mod tests {
                 query: None,
                 max_characters: None,
                 offset: 0,
+                full: false,
+                links: false,
                 json: false,
                 config: Some("s.json".into()),
             }
@@ -508,6 +802,7 @@ mod tests {
                 limit: 0,
                 json: false,
                 engines: vec![],
+                filters: vec![],
                 config: None,
             }
         );
@@ -536,6 +831,7 @@ mod tests {
                 limit: 5,
                 json: false,
                 engines: vec![],
+                filters: vec![],
                 config: None,
             }
         );
@@ -587,6 +883,8 @@ mod tests {
                 query: Some("x y".into()),
                 max_characters: None,
                 offset: 0,
+                full: false,
+                links: false,
                 json: false,
                 config: None,
             }
@@ -617,5 +915,42 @@ mod tests {
     #[test]
     fn fetch_without_urls_is_an_error() {
         assert!(parse(args(&["fetch"])).is_err());
+    }
+
+    #[test]
+    fn research_takes_a_query_additional_intents_and_bounds() {
+        assert_eq!(
+            parse(args(&[
+                "research",
+                "rust",
+                "ownership",
+                "-query",
+                "borrow checker",
+                "-sources",
+                "3",
+                "-chars",
+                "500",
+                "-json",
+            ]))
+            .unwrap(),
+            Command::Research {
+                queries: vec!["rust ownership".into(), "borrow checker".into()],
+                max_per_host: 0,
+                max_attempts: 0,
+                timeout: 0,
+                session: None,
+                synthesize: false,
+                rerank: false,
+                sources: 3,
+                source_characters: 500,
+                total_characters: 0,
+                engines: vec![],
+                filters: vec![],
+                json: true,
+                config: None,
+            }
+        );
+        assert!(parse(args(&["research"])).is_err());
+        assert!(parse(args(&["research", "-sources", "not-a-number"])).is_err());
     }
 }

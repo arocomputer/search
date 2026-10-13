@@ -2,10 +2,62 @@
 
 ## Unreleased
 
+- Review hardening: processors share bounded admission and one deadline within
+  the research budget, report end-to-end latency, and use command-engine working
+  directory defaults. Invalid fetch concurrency is rejected before startup.
+- Preserve distinct URL paths/query bytes, absent HTTP filter defaults, and
+  final-host diversity through redirects. Duplicate research intents no longer
+  multiply engine work or ranking votes; blank downloads are not useful evidence.
+- Correct evaluation alias recall, destination-host diversity, opaque URL
+  identity, blank evidence ranks, and overlapping within-passage span coverage.
+- Keep paired MCP admission consistent across disconnects and transport expiry;
+  terminal output now reports continuation and independent truncation limits,
+  and invalid MCP requests return invalid-parameter errors.
+- Harden robots policy scope, encoded path separators, BOM handling, and host
+  politeness across errors/cancellation. Abort queued parsing on cancellation;
+  complete page reads now share one deadline across admission and redirects.
+- Neutralize multiline image/reference markup and unsafe metadata, and redact
+  URL-bearing body-read diagnostics. Keep completed pages on discovery timeout.
+
+- **Machine-first retrieval.** Directional queries carry domain/date/language/
+  region/category/safety/phrase filters through settings-defined adapters, with
+  explicit unsupported-filter reports. Results retain multiple snippets and
+  update dates. Query caching is transient and bounded; HTTP engines respect
+  bounded retry delays within their deadlines.
+- **Auditable research.** Packets preserve extracted publication dates, final
+  URLs, content hashes, incomplete-download flags, character ranges and
+  continuation offsets. Whole-call deadlines and bounded replacement attempts
+  retain useful partial results; content deduplication and expiring sessions
+  avoid repeated evidence. Coverage distinguishes attempted downloads from
+  useful returned evidence and unvisited candidates.
+- **Collection exploration.** `crawl`/`map`, `web_crawl`/`web_map`, and paired
+  HTTP routes explore guarded same-origin collections with robots rules, path
+  scope, sitemap discovery, politeness, and page/depth/byte/time ceilings.
+- Machine reads default to a configurable character window, with explicit
+  full-page and separate outgoing-link opt-ins. Research defaults and collection
+  ceilings are operator settings, not hardcoded request behavior.
+- Literal text and optional generated prose neutralize active image markup;
+  plaintext source indentation is preserved.
+- Optional configured command processors can rerank evidence or attach cited
+  synthesis on explicit request. Processing runs at the client/host edge,
+  remains bounded and cancellation-safe, and never invokes a model from core.
+- Add offline useful-evidence evaluations and `./x eval` for labeled live/saved
+  packet scoring. Fixture success is not a claim of managed-engine parity.
+
 - Failed fetches keep the HTTP status in their per-URL result (`status: 404`
   rather than `0`) in JSON and MCP output; `0` means no HTTP response.
 - `search fetch -json` exits 1 when any URL fails, as text mode already did. The
   per-URL `error` stays in the JSON output.
+- **Research packets.** `web_research` (MCP), `POST /v1/research` (HTTP) and
+  `search research` run one to five intents, read the best distinct sources, and
+  return a bounded, cited packet of dated passages with a coverage report
+  (`candidates`, `read`, `failed`, `skipped`). Assembly is deterministic and
+  model-free: reciprocal-rank fusion across the intents, per-host diversity, and
+  per-source and total character ceilings, shared by every surface.
+- Result rows carry a `published` date when the engine reports one, so a packet
+  can cite when a source was published. The HTTP adapter's `published_pointer`
+  locates it (default `/published`; SearXNG maps `/publishedDate`), and the
+  command protocol accepts an optional `published`.
 - **Read whole pages.** Extraction no longer cuts raw HTML at 120,000 characters,
   which lost the article on large pages (Wikipedia returned its contents list,
   GitHub its "Skip to content" link) without reporting truncation. Readability
@@ -84,6 +136,8 @@
   matching the documented default; every surface still caps requests at 50.
 - Count blank-line separators against focused-passage budgets so joined
   passages fit their character limit.
+- `truncated` reports only a download cut at `fetch.max_response_bytes`; a
+  `max_characters` window signals continuation through `next_offset` alone.
 
 - Add native x86_64/ARM64 CI and release builds for Linux, macOS, and Windows;
   publish Windows ZIPs and a checksummed PowerShell installer, and test installers

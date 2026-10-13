@@ -56,7 +56,9 @@ pub const PRESETS: &[Preset] = &[
                 "results_pointer": "/results",
                 "title_pointer": "/title",
                 "url_pointer": "/url",
-                "snippet_pointer": "/content"
+                "snippet_pointer": "/content",
+                "filter_params": {"freshness":"time_range", "language":"language", "category":"categories"},
+                "published_pointer": "/publishedDate"
             })
         },
     },
@@ -203,6 +205,9 @@ impl Adapter {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Adapter::Command(settings) => {
+                if !matches!(settings.version, 1 | 2) {
+                    return Err("version must be 1 (legacy) or 2 (filters)");
+                }
                 if settings.command.trim().is_empty() || settings.command.contains('\0') {
                     return Err("command must name an executable");
                 }
@@ -238,6 +243,34 @@ impl Adapter {
                 {
                     return Err("query_param and limit_param must be nonempty and distinct");
                 }
+                let mut params = std::collections::BTreeSet::new();
+                params.insert(settings.query_param.as_str());
+                if let Some(param) = &settings.limit_param {
+                    params.insert(param.as_str());
+                }
+                for (field, param) in &settings.filter_params {
+                    if ![
+                        "freshness",
+                        "start_date",
+                        "end_date",
+                        "include_domains",
+                        "exclude_domains",
+                        "language",
+                        "region",
+                        "category",
+                        "safe",
+                        "exact_phrase",
+                    ]
+                    .contains(&field.as_str())
+                        || param.is_empty()
+                        || param.chars().any(char::is_control)
+                        || !params.insert(param.as_str())
+                    {
+                        return Err(
+                            "filter_params requires known filters and distinct nonempty parameters",
+                        );
+                    }
+                }
                 if http_url(&settings.url).is_none() {
                     return Err("url must be http(s) without credentials or fragment");
                 }
@@ -249,9 +282,12 @@ impl Adapter {
                     &settings.title_pointer,
                     &settings.url_pointer,
                     &settings.snippet_pointer,
+                    &settings.published_pointer,
+                    &settings.snippets_pointer,
+                    &settings.updated_pointer,
                 ] {
                     if !valid_pointer(pointer) {
-                        return Err("results_pointer/title_pointer/url_pointer/snippet_pointer must be valid JSON pointers");
+                        return Err("results_pointer/title_pointer/url_pointer/snippet_pointer/published_pointer/snippets_pointer/updated_pointer must be valid JSON pointers");
                     }
                 }
                 if settings
@@ -342,6 +378,7 @@ pub(crate) fn safe_field_path(path: &serde_path_to_error::Path) -> String {
         "max_response_bytes",
         "max_redirects",
         "cache_ttl",
+        "cache_bytes",
         "allow_private_networks",
         "max_concurrency",
         "enabled",
@@ -358,12 +395,38 @@ pub(crate) fn safe_field_path(path: &serde_path_to_error::Path) -> String {
         "title_pointer",
         "url_pointer",
         "snippet_pointer",
+        "published_pointer",
         "text_part_pointer",
         "command",
         "args",
         "env",
         "temp_dir",
         "cwd",
+        "version",
+        "filter_params",
+        "retry_after_max",
+        "snippets_pointer",
+        "updated_pointer",
+        "research",
+        "crawl",
+        "processing",
+        "sources",
+        "source_characters",
+        "total_characters",
+        "max_per_host",
+        "max_attempts",
+        "session_ttl",
+        "session_entries",
+        "read_characters",
+        "max_pages",
+        "max_hosts",
+        "host_ttl",
+        "max_depth",
+        "max_bytes",
+        "delay",
+        "reranker",
+        "synthesizer",
+        "max_output_bytes",
     ];
     let mut fields = Vec::new();
     for segment in path {
@@ -534,6 +597,69 @@ mod tests {
                 .to_string();
             assert!(!error.contains("secret"), "{error}");
             assert!(error.contains("engine fixture"), "{error}");
+        }
+    }
+
+    /// A settings diagnostic names the failing field. This pins the allowlist
+    /// that keeps arbitrary (possibly secret) map keys out of the message: a
+    /// missing field name silently degrades the path to its parent.
+    #[test]
+    fn diagnostic_field_paths_name_the_failing_field() {
+        for (source, field) in [
+            (r#"{"fetch":{"cache_bytes":"x"}}"#, "fetch.cache_bytes"),
+            (r#"{"fetch":{"timeout":"x"}}"#, "fetch.timeout"),
+            (r#"{"engines":{"use":1}}"#, "engines.use"),
+        ] {
+            let mut deserializer = serde_json::Deserializer::from_str(source);
+            let result: Result<Config, _> = serde_path_to_error::deserialize(&mut deserializer);
+            let error = result.expect_err(source);
+            assert_eq!(safe_field_path(error.path()), field, "{source}");
+        }
+    }
+    /// Filter mappings cannot overwrite query/limit fields or silently accept typos.
+    #[test]
+    fn filter_mapping_and_version_validation_is_strict_and_opaque() {
+        for fields in [
+            json!({"filter_params":{"unknown":"x"}}),
+            json!({"filter_params":{"safe":"q"}}),
+            json!({"filter_params":{"language":"x","region":"x"}}),
+            json!({"filter_params":{"safe":""}}),
+            json!({"snippets_pointer":"bad"}),
+            json!({"updated_pointer":"/bad~2"}),
+        ] {
+            let mut adapter = json!({"type":"http","url":"https://example.com"});
+            adapter
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(resolve(json!({"config":{"fixture":adapter}})).is_err());
+        }
+        for version in [0, 3] {
+            assert!(resolve(
+                json!({"config":{"fixture":{"type":"command","command":"tool","version":version}}})
+            )
+            .is_err());
+        }
+        for version in [1, 2] {
+            assert!(resolve(
+                json!({"config":{"fixture":{"type":"command","command":"tool","version":version}}})
+            )
+            .is_ok());
+        }
+        for (source, expected) in [
+            (
+                r#"{"processing":{"max_output_bytes":"secret"}}"#,
+                "processing.max_output_bytes",
+            ),
+            (
+                r#"{"research":{"session_entries":"secret"}}"#,
+                "research.session_entries",
+            ),
+            (r#"{"crawl":{"max_pages":"secret"}}"#, "crawl.max_pages"),
+        ] {
+            let mut de = serde_json::Deserializer::from_str(source);
+            let error = serde_path_to_error::deserialize::<_, Config>(&mut de).unwrap_err();
+            assert_eq!(safe_field_path(error.path()), expected);
         }
     }
 }

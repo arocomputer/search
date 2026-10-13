@@ -6,7 +6,8 @@ client/engine crate. Public APIs use the native modules below.
 
 | Module | Contract / source |
 | --- | --- |
-| `search::core` | Protocol-free `Search`, `Config`, `Query`, `Answer`, `Page`, `Link`; `src/core/{config,engines,fetch,text,service}` |
+| `search::core` | Protocol-free `Search`, `Config`, `Query`, `Answer`, `Page`, `Link`; `src/core/{config,engines,fetch,text,research,service}` |
+| `search::core::research` | Deterministic evidence packets: `Packet`, `Evidence`, `Coverage`, `ResearchOptions`; `src/core/research.rs` |
 | `search::core::engines` | `Engine`, `Pool`, `EngineState`, `EngineStatus`, `EngineError`, `Found`; `src/core/engines/` |
 | `search::client` | `Client` for shared local/remote execution and pinned HTTPS; `src/client/mod.rs` |
 | `search::mcp` | `Server`, tools and stdio transport in `src/mcp/mod.rs`; streamable HTTP in `src/mcp/http.rs` |
@@ -58,6 +59,27 @@ private `Adapter` implements the HTTP and command transports, skipping and
 counting invalid result rows. `Pool` owns running adapters; HTTP engines reuse
 one client. Engine-specific behavior belongs in settings and programs, never in
 per-engine Rust code.
+
+`search::core::research` assembles an evidence packet: it runs one or more
+queries through `Pool`, fuses their leads with reciprocal-rank fusion, reads the
+best distinct sources (per-host diversity, bounded by `ResearchOptions`), scores
+passages against the intent with `core::text`, and returns dated, cited
+`Evidence` with a `Coverage` report. It is deterministic and model-free;
+optional synthesis belongs at the client edge, never the default. The packet is the machine's
+research primitive: one call replaces the find-then-fetch-then-trim loop an agent
+would otherwise hand-roll.
+
+`search::core::crawl` owns robots-aware, same-origin collection traversal and
+mapping. It reuses the guarded fetcher for pages, robots, and sitemap discovery;
+there is no separate crawler network client or weakened SSRF exception.
+Operator defaults/ceilings live in `core::config`; request validation lives in
+`client`. Ephemeral research sessions and query/page caches are bounded and
+expire in memory; they do not create a persistent corpus.
+
+Optional processing lives in `client::processing`: explicitly configured
+commands can reorder a packet or attach cited generated prose. Core never
+executes a synthesizer or invokes a model. The host executes requested edge
+processing for remote clients under the same output and cancellation bounds.
 
 The fetcher returns `Page`: guarded retrieval, bounded bodies, clean extraction,
 and optional passage selection. Its cache is transient and in memory. There is

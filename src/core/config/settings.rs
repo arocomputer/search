@@ -28,6 +28,9 @@ pub struct Config {
     pub fetch: FetchSettings,
     pub engines: EngineSettings,
     pub remote: RemoteSettings,
+    pub research: super::ResearchSettings,
+    pub crawl: super::CrawlSettings,
+    pub processing: super::ProcessingSettings,
 }
 
 /// Bounds on one search query. Milliseconds on disk; durations in memory.
@@ -38,6 +41,10 @@ pub struct SearchSettings {
     pub max_results: usize,
     /// Milliseconds one search engine may take before it is abandoned.
     pub engine_timeout: u64,
+    /// Milliseconds successful answers remain reusable; zero disables caching.
+    pub cache_ttl: u64,
+    /// Maximum serialized cache payload plus keys; zero disables caching.
+    pub cache_bytes: usize,
     /// Milliseconds allowed for the whole query.
     pub timeout: u64,
 }
@@ -122,6 +129,7 @@ impl RemoteSettings {
 /// A configured engine adapter. Credentials are resolved only at query time.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)] // Inert operator settings keep direct, ergonomic transport fields.
 pub enum Adapter {
     Http(Http),
     Command(Command),
@@ -138,6 +146,12 @@ pub struct Http {
     pub limit_param: Option<String>,
     #[serde(default)]
     pub params: BTreeMap<String, String>,
+    /// Filter field to query parameter; lists become repeated parameters.
+    #[serde(default)]
+    pub filter_params: BTreeMap<String, String>,
+    /// Upper bound on a Retry-After delay in milliseconds; zero disables retries.
+    #[serde(default = "default_retry_after")]
+    pub retry_after_max: u64,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Environment variables supply whole header values, without interpolation.
@@ -151,6 +165,14 @@ pub struct Http {
     pub url_pointer: String,
     #[serde(default = "default_snippet_pointer")]
     pub snippet_pointer: String,
+    /// Optional publication/last-updated date field; omitted when the engine
+    /// reports no date.
+    #[serde(default = "default_published_pointer")]
+    pub published_pointer: String,
+    #[serde(default = "default_snippets_pointer")]
+    pub snippets_pointer: String,
+    #[serde(default = "default_updated_pointer")]
+    pub updated_pointer: String,
     /// Join array-valued titles/snippets by this per-part JSON pointer, when configured.
     #[serde(default)]
     pub text_part_pointer: Option<String>,
@@ -166,6 +188,9 @@ pub struct Http {
 pub struct Command {
     /// An absolute executable path, or a bare name looked up on `PATH`.
     pub command: String,
+    /// Protocol 2 carries filters; select 1 explicitly for legacy executables.
+    #[serde(default = "default_command_version")]
+    pub version: u8,
     /// JSON data passed in the request, never interpolated into arguments.
     #[serde(default)]
     pub config: BTreeMap<String, serde_json::Value>,
@@ -173,7 +198,7 @@ pub struct Command {
     #[serde(default)]
     pub env: Vec<String>,
     /// Absolute working directory; resolution defaults it to the command's
-    /// parent directory when `command` is absolute, otherwise Search home.
+    /// parent directory when `command` is absolute, otherwise private scratch.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// Private scratch directory exported as TMPDIR, TMP, and TEMP to the child.
@@ -226,4 +251,25 @@ fn default_url_pointer() -> String {
 /// Locate a row's optional snippet.
 fn default_snippet_pointer() -> String {
     "/snippet".into()
+}
+/// Locate a row's optional publication or last-updated date.
+fn default_published_pointer() -> String {
+    "/published".into()
+}
+
+/// Current filter-aware command protocol.
+fn default_command_version() -> u8 {
+    2
+}
+/// Maximum upstream-requested pause before one retry.
+fn default_retry_after() -> u64 {
+    1000
+}
+/// Ordered upstream passages.
+fn default_snippets_pointer() -> String {
+    "/snippets".into()
+}
+/// Last update metadata.
+fn default_updated_pointer() -> String {
+    "/updated".into()
 }

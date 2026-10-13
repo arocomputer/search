@@ -33,6 +33,9 @@ impl Default for Config {
             fetch: FetchSettings::default(),
             engines: EngineSettings::default(),
             remote: RemoteSettings::default(),
+            research: super::ResearchSettings::default(),
+            crawl: super::CrawlSettings::default(),
+            processing: super::ProcessingSettings::default(),
         }
     }
 }
@@ -41,6 +44,8 @@ impl Default for SearchSettings {
     fn default() -> Self {
         SearchSettings {
             max_results: 10,
+            cache_ttl: 60_000,
+            cache_bytes: 8 << 20,
             engine_timeout: secs(DEFAULT_ENGINE_SECS),
             timeout: secs(DEFAULT_OVERALL_SECS),
         }

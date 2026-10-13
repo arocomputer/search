@@ -15,8 +15,9 @@ never belong in settings; adapters name the environment variables that hold them
 `SEARCH_HOME` selects the application home (default `~/.search`), independently
 of the working directory and settings file. It must be absolute; a leading `~/`
 is expanded. It holds the default settings file and owner-only pairing
-credentials under `SEARCH_HOME/trust`, and is the default working directory of
-command engines named by a bare command. `ADDRESS` overrides the listener address.
+credentials under `SEARCH_HOME/trust`. Commands without an explicit `cwd` run
+beside an absolute executable or, for a bare PATH name, in private scratch.
+`ADDRESS` overrides the listener address.
 Local CLI and stdio MCP need no pairing; hosting uses [paired HTTPS](remote.md).
 
 ## Settings
@@ -28,6 +29,8 @@ Local CLI and stdio MCP need no pairing; hosting uses [paired HTTPS](remote.md).
   "search": {
     "max_results": 10,
     "engine_timeout": 5000,
+    "cache_ttl": 60000,
+    "cache_bytes": 8388608,
     "timeout": 8000
   },
   "fetch": {
@@ -44,7 +47,32 @@ Local CLI and stdio MCP need no pairing; hosting uses [paired HTTPS](remote.md).
     "use": ["mwmbl"],
     "config": {}
   },
-  "remote": { "timeout": 120000, "max_response_bytes": 67108864 }
+  "remote": { "timeout": 120000, "max_response_bytes": 67108864 },
+  "research": {
+    "sources": 5,
+    "source_characters": 4000,
+    "total_characters": 12000,
+    "max_per_host": 2,
+    "max_attempts": 20,
+    "timeout": 30000,
+    "session_ttl": 600000,
+    "session_entries": 128,
+    "read_characters": 6000
+  },
+  "crawl": {
+    "max_pages": 20,
+    "max_depth": 2,
+    "max_bytes": 16777216,
+    "timeout": 30000,
+    "delay": 100,
+    "max_hosts": 128,
+    "host_ttl": 600000
+  },
+  "processing": {
+    "timeout": 15000,
+    "max_output_bytes": 1048576,
+    "max_concurrency": 2
+  }
 }
 ```
 
@@ -78,11 +106,87 @@ fetch cache; `max_redirects: 0` follows no redirects.
   `engines.config.ID` defines each engine: shallow overrides for the `mwmbl` and
   `searxng` presets (SearXNG needs `url`), or a complete `http`/`command` adapter
   for any other ID. See [engines](engines.md) for fields, setup and trust.
+- `search.cache_ttl` and `search.cache_bytes` bound the transient query cache.
+  Only successful answers are cached, keyed by the entire query, filters, limit,
+  and selected engines. Zero disables caching. Error/timeout answers are retried
+  normally on the next call rather than replayed as successful cached discovery.
 
 The remote connection timeout is 10000 ms; the overall deadline and response
 cap are controlled by the `remote` settings above.
 
+`fetch.timeout` covers a complete page read, including concurrency admission,
+HTTP and meta-refresh redirects, and extraction—not a fresh budget for each
+hop. Running parser work may finish after cancellation, but keeps its shared
+concurrency slot until it finishes; queued work is aborted.
+
+## Machine retrieval
+
+`research` sets operator defaults for evidence count, per-source and total
+passage budgets, same-host diversity, bounded replacement attempts, and the
+whole-call deadline. Requests can select smaller budgets; shared research
+safety ceilings still apply. `read_characters` controls bounded machine reads;
+explicit full-page reads retain the fetcher's byte limit. Session state is
+transient, TTL-expiring, capacity-bounded, and never persisted as a corpus.
+
+`crawl` sets collection ceilings: page count, link depth, total response bytes,
+whole-call deadline, and delay between requests. Requests cannot raise the
+operator ceilings. Traversal is same-origin, can be path-scoped, and honors
+robots rules; a network failure reading robots does not silently grant access.
+Host scheduling is shared across concurrent crawl/map calls: one request per
+host at a time, with spacing at least the configured/observed robots delay.
+`max_hosts` and `host_ttl` bound expiring scheduling records. Idle records can
+be evicted once their required delay has elapsed; active or still-delayed hosts
+are not evicted, and capacity exhaustion is an explicit failure.
+Images and other binary bodies are not crawled as text.
+The in-process crawler retains full extracted pages. Client/CLI/HTTP/MCP crawl
+responses default to per-page `research.read_characters` and total
+`research.total_characters` text windows, reporting omissions/offsets separately
+from download truncation. Explicit crawl `full` opts into complete page text;
+`max_characters` and `total_characters` request options set smaller or larger
+windows within the shared 50,000/200,000 character safety ceilings.
+
+`processing.reranker` and `processing.synthesizer` are optional command adapter
+objects with the same executable, arguments, environment allowlist, private
+scratch directory, and output-bound contract as command engines. Neither runs
+unless a research request explicitly opts in. They execute at the client/host
+edge, never in `search::core`. Request-controlled commands are not supported.
+The shared adapter's `version` setting applies to search-engine requests only;
+packet processors use the separate version-1 envelope below.
+Processor admission is shared across requests to a service and bounded by
+`max_concurrency`. Queueing, reranking, and synthesis share one `processing.timeout`
+budget and cannot extend the request's research deadline. Packet `duration_ms`
+includes this edge processing time; failures preserve the evidence packet.
+
+A processor receives one stdin JSON object:
+
+```json
+{"version":1,"operation":"synthesize","packet":{"queries":[],"sources":[]},"config":{}}
+```
+
+The actual `packet` is the complete research packet, including provenance and
+coverage. A reranker returns `{"urls":[...]}`, containing each evidence URL
+exactly once; it can reorder but not fabricate or replace evidence. A
+synthesizer returns `{"answer":"...","citations":["https://..."]}`. Citations
+must refer to packet sources, and the generated prose remains attached to the
+original evidence. Citation membership checks do not prove factual entailment;
+the caller must still evaluate the generated answer. Failures are reported
+without dropping evidence or exposing processor stdout/stderr in diagnostics.
+
+Processors are trusted host programs, not sandboxed plugins. Their own network
+activity is outside Search's HTTP SSRF guard. Use configured environment
+variables for credentials and never enable a program from fetched content.
+
 ## Migration
+
+Machine reads now default to a bounded character window. Use explicit full-page
+opt-in when you need the entire clean body, or configure `research.read_characters`
+for your usual machine window. Character-window continuation is separate from
+download truncation.
+
+Command adapters default to stdin protocol version 2, which carries directional
+filters. Set `version: 1` for existing wrappers until they honor the new fields;
+version-1 results explicitly report requested filters as unsupported. Existing
+files are not rewritten during upgrades. Optional processing is absent by default.
 
 Search now provides live web search and clean fetch, with no persistent local
 corpus, index queries, or refresh command. Existing files and data are untouched;
