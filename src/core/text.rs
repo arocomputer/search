@@ -6,14 +6,19 @@ use std::collections::HashMap;
 
 use crate::core::fetch::Page;
 
-/// The number of characters a query-focused read returns by default.
-pub const DEFAULT_BUDGET: usize = 6_000;
-
 /// One selected passage with the score that chose it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Passage {
     pub text: String,
     pub score: f64,
+    /// Character range in the original clean page, with an exclusive end.
+    #[serde(default)]
+    pub start_offset: usize,
+    #[serde(default)]
+    pub end_offset: usize,
+    /// Resume at this character when the selected paragraph was clipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 /// What part of a page to return. The default is the whole clean text.
@@ -21,8 +26,8 @@ pub struct Passage {
 pub struct Focus {
     /// Return the passages that match this query instead of the text.
     pub query: Option<String>,
-    /// The most characters to return; without one, a focused read returns
-    /// [`DEFAULT_BUDGET`] and an unfocused read returns everything.
+    /// The most characters to return; absent means no character ceiling.
+    /// Machine callers supply the configured read budget unless full is requested.
     pub max_characters: Option<usize>,
     /// The character to start an unfocused read at, from an earlier `next_offset`.
     pub offset: usize,
@@ -33,6 +38,12 @@ pub struct Focus {
 pub struct FocusedPage {
     #[serde(flatten)]
     pub page: Page,
+    /// Characters in the returned text or passages, excluding separators.
+    #[serde(default)]
+    pub returned_characters: usize,
+    /// Characters in the downloaded clean text before focusing.
+    #[serde(default)]
+    pub available_characters: usize,
     /// Present when a query matched: the passages to read, in document order,
     /// replacing `text`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,33 +56,39 @@ pub struct FocusedPage {
 /// Apply a [`Focus`] to a fetched page. A query that matches returns passages;
 /// one that matches nothing returns the opening of the text instead, so the
 /// reader still sees what the page is. A window that ends before the text does
-/// sets `truncated` and `next_offset`.
+/// sets `next_offset`; `truncated` stays reserved for the fetcher's byte bound.
 pub fn focus(mut page: Page, focus: &Focus) -> FocusedPage {
+    let available_characters = page.text.chars().count();
     let query = focus.query.as_deref().map(str::trim).unwrap_or_default();
     if !query.is_empty() && !page.text.is_empty() {
-        let budget = focus.max_characters.unwrap_or(DEFAULT_BUDGET);
+        let budget = focus.max_characters.unwrap_or(available_characters);
         let found = select(&page.text, query, budget);
         if found.iter().any(|passage| passage.score > 0.0) {
             page.text = String::new();
             return FocusedPage {
                 page,
+                returned_characters: found.iter().map(|p| p.text.chars().count()).sum(),
+                available_characters,
                 passages: Some(found),
                 next_offset: None,
             };
         }
     }
-    let limit = focus
-        .max_characters
-        .or((!query.is_empty()).then_some(DEFAULT_BUDGET))
-        .unwrap_or(usize::MAX);
+    let limit = focus.max_characters.unwrap_or(available_characters);
     let mut rest = page.text.chars().skip(focus.offset);
     let window: String = rest.by_ref().take(limit).collect();
-    let next_offset = rest.next().map(|_| focus.offset + window.chars().count());
-    if next_offset.is_some() {
-        page.truncated = Some(true);
-    }
+    // A zero-character window reads nothing and must not hand back the same
+    // offset, which would spin a caller that follows `next_offset`. A window is
+    // not a truncated download, so it never sets `truncated`.
+    let next_offset = if limit == 0 {
+        None
+    } else {
+        rest.next().map(|_| focus.offset + window.chars().count())
+    };
     page.text = window;
     FocusedPage {
+        returned_characters: page.text.chars().count(),
+        available_characters,
         page,
         passages: None,
         next_offset,
@@ -95,12 +112,15 @@ pub fn select(text: &str, query: &str, budget: usize) -> Vec<Passage> {
         vec![Passage {
             text: head(text, budget),
             score: 0.0,
+            start_offset: 0,
+            end_offset: text.chars().count().min(budget),
+            next_offset: (text.chars().count() > budget).then_some(budget),
         }]
     };
     if terms.is_empty() {
         return opening();
     }
-    let words: Vec<Vec<String>> = paragraphs.iter().map(|p| words(p)).collect();
+    let words: Vec<Vec<String>> = paragraphs.iter().map(|(_, p)| words(p)).collect();
 
     // Document frequency of each query term across paragraphs, for the IDF
     // weight: a term in every paragraph distinguishes nothing.
@@ -155,7 +175,7 @@ pub fn select(text: &str, query: &str, budget: usize) -> Vec<Passage> {
         if remaining == 0 {
             break;
         }
-        let Some(paragraph) = paragraphs.get(index) else {
+        let Some((_, paragraph)) = paragraphs.get(index) else {
             continue;
         };
         let selected = head(paragraph, remaining);
@@ -165,7 +185,18 @@ pub fn select(text: &str, query: &str, budget: usize) -> Vec<Passage> {
     chosen.sort_by_key(|(index, _, _)| *index);
     chosen
         .into_iter()
-        .map(|(_, score, text)| Passage { text, score })
+        .filter_map(|(index, score, text)| {
+            let (start_offset, paragraph) = paragraphs.get(index)?;
+            let end_offset = start_offset + text.chars().count();
+            Some(Passage {
+                next_offset: (text.chars().count() < paragraph.chars().count())
+                    .then_some(end_offset),
+                start_offset: *start_offset,
+                end_offset,
+                text,
+                score,
+            })
+        })
         .collect()
 }
 
@@ -198,21 +229,30 @@ fn words(text: &str) -> Vec<String> {
 }
 
 /// Split on blank lines; fall back to sentences when a page is one long block.
-fn split_paragraphs(text: &str) -> Vec<String> {
-    let mut paragraphs: Vec<String> = text
-        .split("\n\n")
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
+fn split_paragraphs(text: &str) -> Vec<(usize, &str)> {
+    let split = |sentences: bool| {
+        let parts: Vec<&str> = if sentences {
+            text.split_inclusive(['.', '!', '?', '。']).collect()
+        } else {
+            text.split_inclusive("\n\n").collect()
+        };
+        let mut offset = 0;
+        parts
+            .into_iter()
+            .filter_map(|part| {
+                let start = offset + part.chars().take_while(|c| c.is_whitespace()).count();
+                offset += part.chars().count();
+                let trimmed = part.trim();
+                (!trimmed.is_empty()).then_some((start, trimmed))
+            })
+            .collect::<Vec<_>>()
+    };
+    let paragraphs = split(false);
     if paragraphs.len() <= 1 {
-        // No blank-line structure: treat sentences as candidates.
-        paragraphs = text
-            .split_inclusive(['.', '!', '?', '。'])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        split(true)
+    } else {
+        paragraphs
     }
-    paragraphs
 }
 
 /// Lowercased query terms, deduplicated. Single characters are kept only in
@@ -334,6 +374,55 @@ mod tests {
             .any(|p| p.score > 0.0 && p.text.contains("先生")));
     }
 
+    /// Explicitly unbounded focused reads must not apply a hidden read default;
+    /// machine callers supply their configured limit and download cuts survive.
+    #[test]
+    fn focused_reads_have_no_hidden_character_default() {
+        let text = format!("keyword {}", "é".repeat(7000));
+        let mut source = page(&text);
+        source.truncated = Some(true);
+        let read = focus(
+            source,
+            &Focus {
+                query: Some("keyword".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(read.returned_characters, text.chars().count());
+        assert_eq!(read.page.truncated, Some(true));
+        assert_eq!(read.passages.unwrap()[0].next_offset, None);
+    }
+
+    /// Offset ranges are original Unicode character positions, including leading
+    /// whitespace and separators; continuation resumes a clipped paragraph.
+    #[test]
+    fn passages_expose_original_unicode_offsets_and_continuations() {
+        let text = "序文。\n\n  keyword café and details  ";
+        let selected = select(text, "keyword", 10);
+        let passage = &selected[0];
+        assert_eq!(passage.start_offset, 7);
+        assert_eq!(passage.end_offset, 17);
+        assert_eq!(passage.next_offset, Some(17));
+        assert_eq!(
+            text.chars()
+                .skip(passage.start_offset)
+                .take(passage.end_offset - passage.start_offset)
+                .collect::<String>(),
+            passage.text
+        );
+        let read = focus(
+            page(text),
+            &Focus {
+                query: Some("keyword".into()),
+                max_characters: Some(10),
+                ..Default::default()
+            },
+        );
+        assert_eq!(read.returned_characters, 10);
+        assert_eq!(read.available_characters, text.chars().count());
+        assert_eq!(read.passages.unwrap()[0].next_offset, Some(17));
+    }
+
     fn page(text: &str) -> Page {
         Page {
             url: "https://example.com".into(),
@@ -346,6 +435,7 @@ mod tests {
             published: None,
             site: None,
             text: text.into(),
+            links: Vec::new(),
             truncated: None,
             redirect: None,
             error: None,
@@ -364,7 +454,9 @@ mod tests {
             },
         );
         assert_eq!(first.page.text, "abc");
-        assert_eq!(first.page.truncated, Some(true));
+        // A window is not a truncated download: only the fetcher's byte bound
+        // sets `truncated`. Continuation is signalled by `next_offset` alone.
+        assert_eq!(first.page.truncated, None);
         assert_eq!(first.next_offset, Some(3));
         let last = focus(
             page("abcdefgh"),
@@ -382,6 +474,21 @@ mod tests {
             (whole.page.text.as_str(), whole.next_offset),
             ("abcdefgh", None)
         );
+    }
+
+    /// A zero-character window reads nothing and continues nowhere, so a caller
+    /// that follows `next_offset` cannot spin.
+    #[test]
+    fn a_zero_window_does_not_continue() {
+        let read = focus(
+            page("abcdef"),
+            &Focus {
+                max_characters: Some(0),
+                ..Focus::default()
+            },
+        );
+        assert_eq!(read.page.text, "");
+        assert_eq!(read.next_offset, None);
     }
 
     /// A query that matches returns passages; one that does not returns the

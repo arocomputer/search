@@ -153,8 +153,12 @@ into commands or URL templates.
 | `query_param` | Query parameter name; `q` |
 | `limit_param` | Optional count parameter, distinct from `query_param` |
 | `params` | Constant query parameters; `{}` |
+| `filter_params` | Filter field names mapped to HTTP query-parameter names; `{}`; lists become repeated parameters |
+| `retry_after_max` | Maximum permitted Retry-After wait for one 429/503 retry; 1000 ms; zero disables retries, longer delays skip the retry rather than retry early |
 | `results_pointer` | Result array; `/results`; `""` selects a top-level array |
 | `title_pointer`, `url_pointer`, `snippet_pointer` | Row fields; `/title`, `/url`, `/snippet` |
+| `published_pointer` | Optional publication/last-updated date field; `/published`; a malformed date is omitted, never fatal |
+| `updated_pointer`, `snippets_pointer` | Optional update date and multiple snippets; `/updated`, `/snippets` |
 | `text_part_pointer` | Optional text field within each fragment of an array-valued title/snippet; fragments join in order |
 | `headers` | Nonsecret constant headers; `{}` |
 | `header_env` | Header names mapped to environment variable names containing whole header values; `{}` |
@@ -172,11 +176,21 @@ destination names, IP literals, and connect-time DNS. Oversized bodies fail rath
 than yielding partially parsed results. Failure responses do not expose body
 contents or credential values.
 
+Filter mappings use `freshness`, `start_date`, `end_date`, `include_domains`,
+`exclude_domains`, `language`, `region`, `category`, `safe`, and `exact_phrase`.
+Map only semantics the upstream actually supports: parameter presence is an
+operator assertion, not proof of upstream behavior. For example,
+`"filter_params":{"language":"language","category":"categories"}` forwards
+those fields as encoded query data. An unmapped requested field appears in the
+engine's `unsupported_filters`. Formats and list semantics must match your
+endpoint; a generic mapping does not translate vendor-specific enum values.
+
 ### Command adapters
 
 | Adapter field | Meaning / default |
 | --- | --- |
 | `command` | An absolute executable path, or a bare name looked up on `PATH`; run without a shell |
+| `version` | Stdin protocol version; 2 by default, or explicit 1 for legacy executables |
 | `args` | Literal arguments; `[]` |
 | `cwd` | Absolute working directory; defaults to the parent of an absolute `command`, otherwise the engine's private scratch directory (`temp_dir`) |
 | `env` | Credential environment variable names to pass; `[]` |
@@ -207,13 +221,19 @@ a native program needs a Windows `.exe` built for the host architecture.
 Search writes one request to stdin and closes it:
 
 ```json
-{"version":1,"query":"rust async","limit":10,"config":{"endpoint":"https://example.com/search"}}
+{"version":2,"query":"rust async","limit":10,"filters":{"include_domains":["rust-lang.org"]},"config":{"endpoint":"https://example.com/search"}}
 ```
 
 `config` is omitted when empty. The program writes one JSON answer and exits zero:
 
+Version 2 carries the query's `filters` object. A version-2 program is responsible
+for honoring them, refusing the query, or returning an `unsupported_filters`
+list of requested field names; do not silently drop fields. Explicit version 1 omits filters and reports each requested
+filter as unsupported. The JSON POST starter remains a version-1 generic example;
+adapt its payload and opt into version 2 when your vendor mapping honors filters.
+
 ```json
-{"results":[{"title":"Example","url":"https://example.com/","snippet":"Optional summary"}]}
+{"results":[{"title":"Example","url":"https://example.com/","snippet":"Optional summary","snippets":["Another excerpt"],"published":"Optional date","updated":"Optional update date"}]}
 ```
 
 Search assigns engine attribution and ranking; programs cannot forge attribution.
@@ -233,7 +253,9 @@ engines require ongoing maintenance and must respect upstream access policies.
 ### Result rows
 
 For both transports, a row needs a nonempty title and an absolute HTTP(S) URL
-without credentials; a snippet, when present, must be text. Search skips an
+without credentials; a snippet, when present, must be text. A `published` date is
+carried onto the result when the engine gives one and is simply omitted when it
+is missing or malformed. Search skips an
 invalid row rather than failing the engine, and reports the count as `skipped`
 in the engine's status (`mwmbl: ok, skipped 1 invalid results` in the terminal).
 An answer whose rows are all invalid is a failure.

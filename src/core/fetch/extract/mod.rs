@@ -62,11 +62,11 @@ pub(super) fn read(body: &str, url: &str) -> Page {
             title: if article.title.trim().is_empty() {
                 fallback_title
             } else {
-                article.title
+                sanitize(&article.title)
             },
-            byline: article.byline,
-            published: article.published_time,
-            site: article.site_name,
+            byline: article.byline.map(|value| sanitize(&value)),
+            published: article.published_time.map(|value| sanitize(&value)),
+            site: article.site_name.map(|value| sanitize(&value)),
             text: serialize::markdown(&article.text_content),
             redirect: None,
         },
@@ -163,15 +163,17 @@ fn body_text(document: &dom_query::Document) -> String {
     serialize::clean(&text)
 }
 
-/// The document's `<title>`, whitespace-collapsed.
+/// The document's `<title>`, whitespace-collapsed and safe as literal reader text.
 fn title(document: &dom_query::Document) -> String {
-    document
-        .select("title")
-        .first()
-        .text()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    sanitize(
+        &document
+            .select("title")
+            .first()
+            .text()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// Run `dom_smoothie` over the visibility-cleaned document, with settings biased
@@ -211,12 +213,14 @@ fn fallback(body: &str, title: String) -> Page {
     }
 }
 
-/// Make decoded text safe to return: strip control characters other than
-/// newlines and tabs. Used for non-HTML text bodies.
+/// Make decoded literal text safe to return without losing indentation: strip
+/// controls except newlines/tabs and neutralize active image/reference markup.
 pub(super) fn sanitize(text: &str) -> String {
-    text.chars()
+    let text: String = text
+        .chars()
         .filter(|&ch| ch == '\n' || ch == '\t' || !ch.is_control())
-        .collect()
+        .collect();
+    serialize::safe_text(&text)
 }
 
 /// Extract the text layer of a PDF. Scanned PDFs without a text layer read as
@@ -226,6 +230,37 @@ pub(super) fn pdf(bytes: &[u8]) -> Result<String, String> {
     let text = pdf_extract::extract_text_from_mem(bytes)
         .map_err(|_| "PDF could not be read".to_string())?;
     Ok(serialize::clean(&sanitize(&text)))
+}
+
+/// Discover visible navigation independently of prose; image anchors and image
+/// targets are excluded even when they carry an accessible text label.
+pub(super) fn links(body: &str, base: &str) -> Vec<String> {
+    let document = dom_query::Document::from(body);
+    document
+        .select("a:has(img), a:has(picture), a:has(svg)")
+        .remove();
+    visibility::strip(&document);
+    let mut targets = std::collections::BTreeSet::new();
+    for node in document.select("a[href]").nodes() {
+        let Some(href) = node.attr("href") else {
+            continue;
+        };
+        let Some(target) = resolve(base, &href) else {
+            continue;
+        };
+        let Ok(mut url) = url::Url::parse(&target) else {
+            continue;
+        };
+        url.set_fragment(None);
+        if !url.username().is_empty() || url.password().is_some() {
+            continue;
+        }
+        if !super::navigation_target(&url) {
+            continue;
+        }
+        targets.insert(url.to_string());
+    }
+    targets.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -261,6 +296,21 @@ mod tests {
             "hidden div dropped"
         );
         assert!(!page.text.contains("injection"), "sr-only dropped");
+    }
+
+    /// HTML metadata is untrusted reader text, just like the extracted body.
+    #[test]
+    fn title_cannot_restore_active_image_markup() {
+        let page = read(
+            "<title>![pixel](https://example.com/pixel)</title><body>Readable text.</body>",
+            "https://example.com/",
+        );
+        assert_eq!(page.title, "pixel");
+        let page = read(
+            "<title>&lt;img src='pixel'&gt;</title><body>Readable text.</body>",
+            "https://example.com/",
+        );
+        assert_eq!(page.title, "< img src='pixel'>");
     }
 
     #[test]

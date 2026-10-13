@@ -56,8 +56,74 @@ pub(super) fn markdown(text: &str) -> String {
     normalize(text, true)
 }
 
+/// Neutralize active images in literal text without collapsing indentation or
+/// rewriting code punctuation. Reference definitions are made non-resolving.
+pub(super) fn safe_text(text: &str) -> String {
+    // Reference labels may span lines. Scan each possible definition start,
+    // then copy once so large documents do not repeatedly allocate suffixes.
+    let mut breaks = Vec::new();
+    let mut offset = 0;
+    let mut scanned_until = 0;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '>' | '-' | '*' | '+' | '.' | ')')
+                || c.is_ascii_digit()
+        });
+        if body.starts_with('[') {
+            let start = offset + line.len() - body.len();
+            if start >= scanned_until {
+                if let Some(rest) = text.get(start..) {
+                    scanned_until = text.len();
+                    if let Some(close) = rest.find(']') {
+                        scanned_until = start + close + 1;
+                        if rest.as_bytes().get(close + 1) == Some(&b':') {
+                            breaks.push(scanned_until);
+                        }
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    let mut defused = String::with_capacity(text.len());
+    let mut start = 0;
+    for at in breaks {
+        if let Some(part) = text.get(start..at) {
+            defused.push_str(part);
+            defused.push(' ');
+            start = at;
+        }
+    }
+    defused.push_str(text.get(start..).unwrap_or_default());
+    let out = strip_targets(&defused, false);
+    // Raw HTML image elements are active in many Markdown renderers, even when
+    // the response was served as text/plain. Break only real image tag names.
+    let mut safe = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(ch) = chars.next() {
+        safe.push(ch);
+        if ch == '<' {
+            let mut look = chars.clone();
+            let name: String = look
+                .by_ref()
+                .take(6)
+                .take_while(char::is_ascii_alphabetic)
+                .collect();
+            let boundary = chars.clone().nth(name.chars().count());
+            if matches!(name.to_ascii_lowercase().as_str(), "img" | "image")
+                && boundary.is_some_and(|ch| ch.is_whitespace() || matches!(ch, '/' | '>'))
+            {
+                safe.push(' ');
+            }
+        }
+    }
+    safe
+}
+
 /// Shared line normalization for [`clean`] and [`markdown`].
 fn normalize(text: &str, markdown: bool) -> String {
+    let text = safe_text(text);
     let mut out = String::with_capacity(text.len());
     let mut blank = false;
     let mut fence: Option<char> = None;
@@ -101,7 +167,7 @@ fn normalize(text: &str, markdown: bool) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    out.trim().to_string()
+    safe_text(out.trim())
 }
 
 /// Process one Markdown line outside fences: inline code spans are kept
@@ -262,6 +328,42 @@ fn defuse_definition(line: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Literal source text keeps indentation while active Markdown/HTML images
+    /// and image reference definitions become non-loading text.
+    #[test]
+    fn literal_text_cannot_autoload_images_or_lose_code_layout() {
+        let text = "    let x = vec![1];\n    ![pixel](https://example.com/pixel)\n<img src='https://example.com/pixel'>\n![badge][target]\n[target]: https://example.com/pixel\n<imgBuffer>";
+        let safe = safe_text(text);
+        assert!(safe.starts_with("    let x = vec![1];\n    pixel\n"));
+        assert!(!safe.contains("![pixel]"));
+        assert!(!safe.contains("<img "));
+        assert!(safe.contains("< img src="));
+        assert!(safe.contains("[target] :"));
+        assert!(safe.ends_with("<imgBuffer>"));
+    }
+
+    /// CommonMark accepts newlines in image labels, destinations and references.
+    #[test]
+    fn multiline_images_and_reference_definitions_are_neutralized() {
+        for input in [
+            "before ![pixel\nlabel](https://example.com/pixel) after",
+            "![pixel](\nhttps://example.com/pixel\n)",
+        ] {
+            for output in [safe_text(input), markdown(input), clean(input)] {
+                assert!(!output.contains("!["), "{output:?}");
+                assert!(!output.contains("https://example.com/pixel"), "{output:?}");
+            }
+        }
+        let input = "![label][multi\nline]\n[multi\nline]: https://example.com/pixel";
+        for output in [safe_text(input), markdown(input), clean(input)] {
+            assert!(output.contains("line] :"), "{output:?}");
+        }
+        assert_eq!(
+            markdown("```html\n<img src='pixel'>\n```"),
+            "```html\n< img src='pixel'>\n```"
+        );
+    }
 
     #[test]
     fn whitespace_is_collapsed_and_paragraphs_keep_one_blank_line() {

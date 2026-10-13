@@ -4,6 +4,7 @@
     "config": {
       "json-post": {
         "type": "command",
+        "version": 1,
         "command": "python3",
         "args": ["-S", "-B", "engine.py"],
         "cwd": "/absolute/path/to/json-post",

@@ -2,10 +2,10 @@
   <img src="assets/white/lockup.svg#gh-dark-mode-only" alt="Search" height="52">
   <img src="assets/black/lockup.svg#gh-light-mode-only" alt="Search" height="52">
 
-  <h3>Search the web. Read pages cleanly.</h3>
+  <h3>Live retrieval. Auditable evidence.</h3>
 
   <p>Self-hosted web search for people and AI agents.<br>
-  Find pages across independent engines and read them as clean text.</p>
+   Find, read, and explore sources under explicit evidence budgets.</p>
 
   <p>
     <a href="docs/install.md">Install</a> ·
@@ -16,7 +16,7 @@
 
 <br>
 
-## Find and read
+## Retrieve evidence
 
 - **Find:** run the engines defined in your settings in parallel and merge their
   results. Mwmbl is the single keyless default; a failed engine is reported rather
@@ -26,6 +26,18 @@
   the article and strips page clutter. Read the whole clean page, a window that
   continues where you left off, or passages relevant to a query. A transient
   in-memory cache reuses recent fetches.
+- **Research:** one call runs several intents, reads the best distinct sources,
+  and returns a bounded, cited packet of dated passages with a coverage report —
+  the evidence an agent needs to ground an answer, assembled without a model.
+- **Explore:** crawl a same-origin collection or map its URLs, respecting robots
+  rules, path scope, and explicit page, byte, depth, and time limits.
+
+Queries can carry domain, date, language, region, category, safety, and phrase
+filters. Engines report unsupported filters rather than pretending to honor
+them. Research deduplicates content, replaces failed sources within its attempt
+budget, preserves incomplete-download signals, and can exclude previously seen
+evidence using transient sessions. Optional operator-configured reranking and
+synthesis run only when requested, outside the model-free core.
 
 Mwmbl and SearXNG are built-in presets. Bring other services—including AI search
 APIs—as [custom HTTP or command engines](docs/engines.md#custom-engines).
@@ -52,6 +64,8 @@ search version
 search help
 search "rust async runtime"
 search fetch https://www.rust-lang.org -query "async"
+search research "rust async runtime"
+search map https://www.rust-lang.org
 ```
 
 See [installation](docs/install.md) for Homebrew, source builds, and installer
@@ -83,18 +97,18 @@ configuration file. The client process must be able to find `search` on its
 }
 ```
 
-The server exposes two tools: `web_search` for discovery and `web_fetch` for
-clean page reading, with optional query-focused passages. For a shared host,
-select a paired remote; the agent configuration stays the same.
+The server exposes `web_search`, `web_fetch`, `web_research`, `web_crawl`, and
+`web_map`. Machine reads are bounded by default with explicit full-page opt-in.
+For a shared host, select a paired remote; the agent configuration stays the same.
 
 ## One engine, more surfaces
 
 | Surface | Use it for |
 | --- | --- |
-| CLI | One-shot search and fetch |
+| CLI | Search, read, research, crawl, and map |
 | Rust | Use `search::core::Search` as an in-process engine |
-| HTTP | One JSON API for status, search, and fetch, shared by scripts and paired clients |
-| MCP | Give an agent the `web_search` and `web_fetch` tools |
+| HTTP | One paired JSON API for retrieval and collection exploration |
+| MCP | Bounded tools for machine discovery, reading, and evidence assembly |
 
 Search is one Cargo package. Use `search::core::{Search, Config, Query, Answer, Page, Link}` in-process, `search::core::engines` for the engine runtime,
 `search::client::Client` for local/remote routing, and `search::mcp::Server` for MCP.
@@ -172,6 +186,10 @@ GET  /healthz                          liveness
 GET  /v1/status                        version, engines
 GET  /v1/search?q=&limit=&engines=a,b  search live web engines
 POST /v1/fetch {"urls":[...]}          clean pages, {"pages":[...]}
+POST /v1/research {"queries":[...]}    one bounded, cited evidence packet
+POST /v1/search {"text":...,"filters":{...}} directional discovery
+POST /v1/crawl {"url":...}             bounded collection reading
+POST /v1/map {"url":...}               bounded URL inventory
 POST /mcp                              MCP over streamable HTTP
 ```
 
@@ -187,6 +205,11 @@ not expose it to the public internet. Read the [security notes](docs/security.md
 before deployment.
 
 ## Project
+
+Retrieval quality is measured, not inferred from test counts. See
+[retrieval evaluations](docs/contributing/evaluation.md) for reproducible labeled
+scoring and live-engine collection. Offline fixtures prove contracts; they do
+not demonstrate parity with managed indexes or research agents.
 
 Search is early software. See the [docs](docs/README.md), [changelog](CHANGELOG.md),
 and [contributing guide](CONTRIBUTING.md). Licensed under MIT.

@@ -8,7 +8,8 @@ in `core::config::engines`, resolved exactly like custom engines.
 | --- | --- |
 | `mod.rs` | `Engine`, `EngineState`, `EngineStatus`, `EngineError`, `Found` |
 | `adapter.rs` | HTTP and command transports and result-row mapping |
-| `pool.rs` | Concurrent execution, deadlines, reciprocal-rank fusion and URL dedup |
+| `pool.rs` | Concurrent execution, deadlines, reciprocal-rank fusion across and within queries, and URL dedup |
+| `cache.rs` | Bounded TTL cache of fully successful answers keyed by complete queries |
 | `scratch.rs` | Private command scratch directories |
 
 `Pool::new` resolves each ID in `engines.use` through
@@ -17,7 +18,9 @@ in `core::config::engines`, resolved exactly like custom engines.
 absolute `cwd`. Construction reads no credentials and runs no engine code; HTTP
 engines build one guarded client each and reuse it. Reciprocal-rank fusion
 counts each normalized URL once per engine, using its best rank; duplicate rows
-cannot substitute for agreement between engines.
+cannot substitute for agreement between engines. URL identities remove fragments
+and tracking parameters while preserving significant path slashes and the raw
+encoding of other query parameters.
 
 Adapters map an upstream JSON answer into `Found`. An invalid row (empty title,
 missing or non-HTTP(S) URL, URL credentials, non-text snippet) is skipped and
@@ -44,6 +47,35 @@ Scratch files are not removed automatically.
 The pool runs every selected engine under `search.engine_timeout` and the whole
 query under `search.timeout`. A failed, timed-out, or panicking engine is
 reported by name in its `EngineState` beside the other engines' results.
+
+`Engine::search_query` accepts the full `Query`; legacy trait implementations
+continue to implement `search` and report every requested filter unsupported.
+`QueryFilters::validate` checks bounded text, DNS domains and real calendar dates.
+HTTP `filter_params` maps filter field names to distinct query parameters; lists
+use repeated parameters and requested values override static settings. Omitted
+filters retain configured static defaults. Unmapped
+constraints appear in `EngineState.unsupported_filters`, including on failure.
+No date filter is claimed merely because results carry date metadata.
+
+Command settings default to `version: 2`: stdin carries `version`, `query`,
+`limit`, `filters` and optional `config`. Set `version: 1` explicitly for legacy
+executables; their request shape remains unchanged and requested constraints are
+reported unsupported. Command v2 programs must honor filters or return `unsupported_filters` in their
+response. The pool accepts only requested filter names from that report.
+Both transports preserve `snippets`, `published` and `updated`; fusion retains
+all distinct snippets. HTTP paths are configurable with `snippets_pointer` and
+`updated_pointer`.
+
+The pool stores only answers whose engines all succeeded, keyed by the complete
+query text, filters, requested limit and engine selection. `search.cache_ttl`
+(default 60000 ms) and `search.cache_bytes` (default 8 MiB) bound reuse; either zero
+disables storage. FIFO eviction counts serialized answers, keys and entry overhead.
+HTTP 429/503 responses with a valid `Retry-After` (seconds or IMF-fixdate) trigger
+one retry only when the full server-requested delay fits `retry_after_max`
+(default 1000 ms, zero turns retries off). A larger delay returns the original
+HTTP rejection without retrying; delays are never shortened to fit the budget.
+Backoff and the retry share existing engine/query deadlines
+and are cancelled when the caller drops the query.
 
 For configuration, adapter fields, credentials, and troubleshooting, see the
 [engine guide](../../../docs/engines.md). The

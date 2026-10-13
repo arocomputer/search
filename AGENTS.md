@@ -44,8 +44,11 @@ src/core/      protocol-free engine (`search::core::Search`)
     extract/   main content (Markdown), visibility filtering, PDF text, image guard
     cache.rs   transient in-memory pages
   text.rs      focus: query passages and continuable character windows
+  crawl.rs     bounded robots-aware collection traversal and mapping
+  research.rs  deterministic evidence packets: Packet, Evidence, Coverage
   service.rs   the in-process Search service; Query, Answer, Link
 src/client/mod.rs  shared local/remote execution, input bounds and pinned HTTPS
+src/client/processing.rs explicit bounded packet reranking and synthesis
 src/mcp/       mod.rs tools and stdio transport; http.rs streamable HTTP transport
 src/cli/       CLI and paired HTTPS host
   args.rs      command parsing
@@ -102,7 +105,8 @@ dependencies; `mcp` enables optional `rmcp`.
   agent, and the enabled engines are read from configuration with built-in
   defaults. A new user-facing behaviour becomes a config field, not a constant.
 - **Keep the vocabulary consistent.** `search::core` exposes `Search`, `Config`,
-  `Query`, `Answer`, `Page`, and `Link`. `search::core::engines` exposes `Engine`,
+  `Query`, `Answer`, `Page`, and `Link`; `search::core::research` exposes
+  `Packet`, `Evidence`, `Coverage`, and `ResearchOptions`. `search::core::engines` exposes `Engine`,
   `Pool`, `EngineState`, `EngineStatus`, `EngineError`, and `Found`. Fetch returns
   `Page`; user fields and CLI selection use `engines` and `-engines`; an engine's
   `engines.config` entry is its adapter. Use native module imports, without old
@@ -119,6 +123,18 @@ dependencies; `mcp` enables optional `rmcp`.
   byte bound reports `truncated`, and a character window reports `next_offset`.
   Readers choose how much to read through `core::text::focus`; CLI and MCP must
   not reimplement it.
+- **Research assembles; it never synthesizes.** `core::research` runs a
+  deterministic, model-free pipeline — fan out, fuse with RRF, read the best
+  distinct sources, score passages with `core::text` — and returns a bounded
+  packet with a coverage report. No model call belongs in core; a synthesizer is
+  an optional trusted command at the client edge, never a default. Every bound is a config field, and a
+  packet never exceeds its `ResearchOptions` ceilings.
+- **Crawling keeps the fetch trust boundary.** Every page, robots, sitemap and
+  redirect goes through the guarded fetcher. Stay same-origin/path-scoped,
+  respect robots, and bound pages, depth, bytes, delay and the whole-call time.
+- **Quality claims need retrieval evidence.** Offline labeled evaluations pin
+  useful-source recall and context contracts; they are not proof of live-index
+  quality or competitive parity. `./x eval` scores labeled saved/live packets.
 - **Extraction must be precise before it is aggressive.** A false removal loses
   the article; match class tokens and segments and parse styles, never substrings.
   Image markup must not survive in any output (prose, code, nested links, reference

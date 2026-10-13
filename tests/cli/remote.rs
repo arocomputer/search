@@ -23,6 +23,20 @@ impl Fixture {
     }
     /// Start a host with a chosen service default to test HTTP limit resolution.
     async fn with_settings(window: std::time::Duration, max_results: usize) -> Self {
+        Self::with_config(
+            window,
+            search::core::Config {
+                search: search::core::config::SearchSettings {
+                    max_results,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    /// Start the real paired host with chosen machine defaults and an offline engine.
+    async fn with_config(window: std::time::Duration, mut config: search::core::Config) -> Self {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -31,20 +45,15 @@ impl Fixture {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let config = search::core::Config {
-            home: root.clone(),
-            address: address.to_string(),
-            search: search::core::config::SearchSettings {
-                max_results,
-                ..Default::default()
-            },
-            engines: search::core::config::EngineSettings {
+        config.home = root.clone();
+        config.address = address.to_string();
+        if config.engines.use_engines == ["mwmbl"] {
+            config.engines = search::core::config::EngineSettings {
                 use_engines: vec!["fixture".into()],
                 config: [("fixture".into(), fixture_engine(&root))].into(),
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
+        }
         let engine = Arc::new(search::core::Search::open(config).unwrap());
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
             host.cert.as_bytes().to_vec(),
@@ -106,6 +115,51 @@ impl Drop for Fixture {
         self.task.abort();
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// Concurrent MCP initialization reserves capacity before creating transports;
+/// a successful deletion releases the same slot for the next session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_transport_capacity_is_reserved_before_initialization() {
+    let mut config = search::core::Config::default();
+    config.research.session_entries = 1;
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(60), config).await;
+    let profile = fixture.pair().await;
+    let client = client_api::client(&profile).unwrap();
+    let initialize = || {
+        client.post(format!("{}/mcp", fixture.url))
+        .bearer_auth(&profile.secret).header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"capacity","version":"1"}
+        }}))
+    };
+    let (first, second) = tokio::join!(initialize().send(), initialize().send());
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let (accepted, refused) = if first.status().is_success() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(accepted.status().is_success());
+    assert_eq!(refused.status(), 503);
+    let session = accepted
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let deleted = client
+        .delete(format!("{}/mcp", fixture.url))
+        .bearer_auth(&profile.secret)
+        .header("mcp-session-id", &session)
+        .header("Accept", "application/json, text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success());
+    assert!(initialize().send().await.unwrap().status().is_success());
 }
 
 /// Paired responses honor local bounds without retrying or switching targets.
@@ -356,6 +410,7 @@ json.dump({'results':[{'url':'https://example.invalid/needle','title':'Remote ne
     serde_json::json!({
         "type": "command",
         "command": if cfg!(windows) { "python.exe" } else { "python3" },
+        "version": 1,
         "args": ["program.py"],
         "cwd": root
     })
@@ -502,6 +557,34 @@ async fn host_refuses_out_of_bounds_input() {
     assert_eq!(fetch.status(), 400);
 }
 
+/// The host exposes research on the same paired API, with one bounded packet
+/// per request and the shared input bounds enforced server-side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_research_returns_one_bounded_packet() {
+    let fixture = Fixture::new().await;
+    let profile = fixture.pair().await;
+    let client = client_api::client(&profile).unwrap();
+    let response = client
+        .post(format!("{}/v1/research", fixture.url))
+        .bearer_auth(&profile.secret)
+        .json(&serde_json::json!({"queries": ["needle"], "options": {"sources": 2}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let packet: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(packet["queries"][0], "needle");
+    assert_eq!(packet["coverage"]["candidates"], 1);
+    let bad = client
+        .post(format!("{}/v1/research", fixture.url))
+        .bearer_auth(&profile.secret)
+        .json(&serde_json::json!({"queries": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}
+
 /// A duplicate host cannot supersede the running host's admission state before bind succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_serve_preserves_pairing_state() {
@@ -601,5 +684,841 @@ fn missing_trust_selection_checks_replacement_boundary() {
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(!run().status.success());
     assert!(!home.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Own public-content fixtures on loopback; only explicit test settings allow their addresses.
+struct PagesFixture {
+    url: String,
+    blocked_hits: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl PagesFixture {
+    /// Serve two distinct articles, a forbidden link, and deterministic robots policy.
+    async fn new() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let article = format!("<html><head><title>Research root</title></head><body><article><h1>Research root</h1><p>{}</p><p><a href='/docs/child'>Child article</a> <a href='/docs/blocked'>Forbidden</a><img src='/image.png'></p></article></body></html>", "Evidence about rust ownership from a useful source. ".repeat(40));
+        let child = format!("<html><head><title>Research child</title></head><body><article><h1>Research child</h1><p>{}</p></article></body></html>", "Independent evidence about rust ownership and borrowing. ".repeat(40));
+        let blocked_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocked_counter = blocked_hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/robots.txt",
+                axum::routing::get(|| async { "User-agent: *\nDisallow: /docs/blocked\n" }),
+            )
+            .route(
+                "/docs/",
+                axum::routing::get(move || {
+                    let article = article.clone();
+                    async move { axum::response::Html(article) }
+                }),
+            )
+            .route(
+                "/docs/child",
+                axum::routing::get(move || {
+                    let child = child.clone();
+                    async move { axum::response::Html(child) }
+                }),
+            )
+            .route(
+                "/docs/blocked",
+                axum::routing::get(move || {
+                    let counter = blocked_counter.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        "forbidden article"
+                    }
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            url,
+            task,
+            blocked_hits,
+        }
+    }
+    /// Configure a version-two engine that echoes every requested filter and finds both articles.
+    fn settings(&self) -> serde_json::Value {
+        let root = format!("{}/docs/", self.url);
+        let child = format!("{}/docs/child", self.url);
+        let filter_json = serde_json::json!({"freshness":"week","start_date":"2024-02-29","end_date":"2026-10-13","include_domains":["example.com"],"exclude_domains":["other.com"],"language":"en","region":"GB","category":"science","safe":false,"exact_phrase":"rust ownership"}).to_string();
+        let program = format!("import json,sys; r=json.load(sys.stdin); assert r['query']!='filtered research' or r['filters']==json.loads({filter_json:?}); assert r['version']==2; json.dump({{'results':[{{'url':{root:?},'title':json.dumps(r['filters'],sort_keys=True),'snippet':'rust ownership'}},{{'url':{child:?},'title':'Independent evidence','snippet':'rust ownership'}}]}},sys.stdout)");
+        serde_json::json!({
+            "engines":{"use":["machine"],"config":{"machine":{"type":"command","version":2,"command":if cfg!(windows) {"python.exe"} else {"python3"},"args":["-c",program]}}},
+            "fetch":{"allow_private_networks":true},
+            "research":{"read_characters":48,"sources":2,"source_characters":80,"total_characters":140,"max_per_host":2},
+            "crawl":{"max_pages":3,"max_depth":2,"delay":1}
+        })
+    }
+    /// Decode the same settings used by CLI subprocesses and paired hosts.
+    fn config(&self) -> search::core::Config {
+        serde_json::from_value(self.settings()).unwrap()
+    }
+}
+impl Drop for PagesFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Local and paired reads use host windows, expose continuation, and opt in to full text and links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_reads_resolve_host_defaults_and_preserve_explicit_full_and_links() {
+    use search::client::ReadRequest;
+    let pages = PagesFixture::new().await;
+    let config = pages.config();
+    let local = Client::Local(Arc::new(
+        search::core::Search::open(config.clone()).unwrap(),
+    ));
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), config).await;
+    let remote = Client::remote(fixture.pair().await).unwrap();
+    for client in [local, remote] {
+        let request = ReadRequest {
+            urls: vec![format!("{}/docs/", pages.url)],
+            ..Default::default()
+        };
+        let first = client.read(request.clone()).await.unwrap().remove(0);
+        assert_eq!(first.page.text.chars().count(), 48);
+        assert_eq!(first.next_offset, Some(48));
+        assert!(first.page.links.is_empty());
+        let custom = client
+            .read(ReadRequest {
+                max_characters: Some(100),
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(custom.page.text.chars().count(), 100);
+        assert_eq!(custom.next_offset, Some(100));
+        let second = client
+            .read(ReadRequest {
+                offset: 48,
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let full = client
+            .read(ReadRequest {
+                full: true,
+                links: true,
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(full.page.text.chars().count() > 1000);
+        assert!(full.next_offset.is_none());
+        assert_eq!(
+            first.page.text + &second.page.text,
+            full.page.text.chars().take(96).collect::<String>()
+        );
+        assert!(full
+            .page
+            .links
+            .contains(&format!("{}/docs/child", pages.url)));
+        assert!(full
+            .page
+            .links
+            .iter()
+            .all(|link| !link.contains("image.png")));
+        let focused = client
+            .read(ReadRequest {
+                query: Some("ownership".into()),
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            focused
+                .passages
+                .unwrap()
+                .iter()
+                .map(|p| p.text.chars().count())
+                .sum::<usize>()
+                <= 48
+        );
+        assert!(client
+            .read(ReadRequest {
+                full: true,
+                max_characters: Some(4),
+                ..request
+            })
+            .await
+            .is_err());
+    }
+}
+
+/// POST search and research carry identical filters; host research defaults stay authoritative.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_filters_and_successful_research_match_locally_and_remotely() {
+    use search::client::ResearchRequest;
+    let pages = PagesFixture::new().await;
+    let config = pages.config();
+    let local = Client::Local(Arc::new(
+        search::core::Search::open(config.clone()).unwrap(),
+    ));
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), config).await;
+    let profile = fixture.pair().await;
+    let remote = Client::remote(profile.clone()).unwrap();
+    let filters: search::core::QueryFilters = serde_json::from_value(serde_json::json!({"freshness":"week","start_date":"2024-02-29","end_date":"2026-10-13","include_domains":["example.com"],"exclude_domains":["other.com"],"language":"en","region":"GB","category":"science","safe":false,"exact_phrase":"rust ownership"})).unwrap();
+    for client in [local, remote] {
+        let answer = client
+            .search(search::core::Query {
+                text: "rust ownership".into(),
+                filters: filters.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let echoed: serde_json::Value = serde_json::from_str(&answer.results[0].title).unwrap();
+        assert_eq!(echoed, serde_json::to_value(&filters).unwrap());
+        let packet = client
+            .research(ResearchRequest {
+                queries: vec!["filtered research".into()],
+                options: search::core::ResearchOptions {
+                    filters: filters.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(packet.coverage.read, 2);
+        assert!(packet.characters > 0 && packet.characters <= 140);
+        assert!(packet.sources.iter().all(|source| source.error.is_none()
+            && source
+                .content_hash
+                .as_ref()
+                .is_some_and(|hash| hash.len() == 64)));
+        assert!(packet.synthesis.is_none());
+        let session_request = ResearchRequest {
+            queries: vec!["rust ownership".into()],
+            options: search::core::ResearchOptions {
+                session: Some("disabled-processing-session".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(client
+            .research(ResearchRequest {
+                synthesize: true,
+                ..session_request.clone()
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            client
+                .research(session_request)
+                .await
+                .unwrap()
+                .coverage
+                .read,
+            2
+        );
+        assert!(client
+            .search(search::core::Query {
+                text: "q".into(),
+                filters: search::core::QueryFilters {
+                    start_date: Some("2025-02-29".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .is_err());
+        assert!(client
+            .research(ResearchRequest {
+                queries: vec!["rust".into()],
+                synthesize: true,
+                ..Default::default()
+            })
+            .await
+            .is_err());
+        assert!(client
+            .research(ResearchRequest {
+                queries: vec!["rust".into()],
+                rerank: true,
+                ..Default::default()
+            })
+            .await
+            .is_err());
+    }
+    let response = client_api::client(&profile)
+        .unwrap()
+        .get(format!("{}/v1/search", fixture.url))
+        .bearer_auth(&profile.secret)
+        .query(&[("q", "rust ownership")])
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+}
+
+/// The same bounded crawler executes behind both routes and never follows robots-forbidden links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_crawl_and_map_match_local_and_paired_hosts() {
+    let pages = PagesFixture::new().await;
+    let config = pages.config();
+    let local = Client::Local(Arc::new(
+        search::core::Search::open(config.clone()).unwrap(),
+    ));
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), config).await;
+    let remote = Client::remote(fixture.pair().await).unwrap();
+    for client in [local, remote] {
+        let request = search::core::CrawlRequest {
+            url: format!("{}/docs/", pages.url),
+            options: search::core::CrawlOptions {
+                path_prefix: Some("/docs/".into()),
+                ..Default::default()
+            },
+        };
+        let crawl = client.crawl(request.clone()).await.unwrap();
+        assert_eq!(crawl.pages.len(), 2, "{crawl:?}");
+        assert_eq!(
+            pages
+                .blocked_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(crawl
+            .pages
+            .iter()
+            .all(|page| !page.text.is_empty() && page.error.is_none()));
+        assert!(crawl.urls.contains(&format!("{}/docs/child", pages.url)));
+        assert!(!crawl.urls.contains(&format!("{}/docs/blocked", pages.url)));
+        let map = client.map(request).await.unwrap();
+        assert!(map.pages.is_empty());
+        assert_eq!(map.urls, crawl.urls);
+        assert!(!map.timed_out);
+        assert!(client
+            .map(search::core::CrawlRequest {
+                url: "file:///tmp/x".into(),
+                options: Default::default()
+            })
+            .await
+            .is_err());
+    }
+}
+
+/// Collection text has both per-page and total windows on local/remote machine
+/// surfaces, with recoverable offsets and explicit full-page opt-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crawl_text_windows_do_not_hide_omitted_page_content() {
+    let pages = PagesFixture::new().await;
+    let config = pages.config();
+    let local = Client::Local(Arc::new(
+        search::core::Search::open(config.clone()).unwrap(),
+    ));
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), config).await;
+    let remote = Client::remote(fixture.pair().await).unwrap();
+    for client in [local, remote] {
+        let mut request = search::core::CrawlRequest {
+            url: format!("{}/docs/", pages.url),
+            options: Default::default(),
+        };
+        request.options.max_characters = 100;
+        request.options.total_characters = 1;
+        let report = client.crawl(request.clone()).await.unwrap();
+        assert_eq!(report.pages.len(), 2);
+        assert_eq!(
+            report
+                .pages
+                .iter()
+                .map(|page| page.text.chars().count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(report.windows[0].returned_characters, 1);
+        assert_eq!(report.windows[0].next_offset, Some(1));
+        assert_eq!(report.windows[1].returned_characters, 0);
+        assert_eq!(report.windows[1].next_offset, Some(0));
+        assert!(report
+            .windows
+            .iter()
+            .all(|window| window.available_characters > 100));
+        assert!(report.pages.iter().all(|page| page.truncated.is_none()));
+        request.options.max_characters = 0;
+        request.options.total_characters = 0;
+        request.options.full = true;
+        let full = client.crawl(request).await.unwrap();
+        assert!(full.windows.is_empty());
+        assert!(full
+            .pages
+            .iter()
+            .all(|page| page.text.chars().count() > 100));
+    }
+}
+
+/// Authenticated device identity namespaces user session tokens and owns MCP transport sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn research_sessions_and_mcp_sessions_do_not_leak_between_devices() {
+    use search::client::ResearchRequest;
+    let pages = PagesFixture::new().await;
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), pages.config()).await;
+    let first = fixture.pair().await;
+    let code = auth::pair_code(&fixture.host.path, std::time::Duration::from_secs(900)).unwrap();
+    let credential = fixture.host.pair(&code, "second-device").unwrap();
+    let second = Remote {
+        secret: credential.secret,
+        device: credential.device,
+        ..fixture.profile()
+    };
+    let request = ResearchRequest {
+        queries: vec!["rust ownership".into()],
+        options: search::core::ResearchOptions {
+            session: Some("shared-user-token".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let first_client = Client::remote(first.clone()).unwrap();
+    assert_eq!(
+        first_client
+            .research(request.clone())
+            .await
+            .unwrap()
+            .coverage
+            .read,
+        2
+    );
+    let repeated = first_client.research(request.clone()).await.unwrap();
+    assert_eq!(repeated.coverage.read, 0);
+    assert_eq!(repeated.coverage.previously_seen, 2);
+    assert_eq!(
+        Client::remote(second.clone())
+            .unwrap()
+            .research(request)
+            .await
+            .unwrap()
+            .coverage
+            .read,
+        2
+    );
+    let http = client_api::client(&first).unwrap();
+    let initialize = http.post(format!("{}/mcp", fixture.url)).bearer_auth(&first.secret).header("Accept","application/json, text/event-stream").json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"owner","version":"1"}}})).send().await.unwrap();
+    assert!(initialize.status().is_success());
+    let session = initialize
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let stolen = http
+        .post(format!("{}/mcp", fixture.url))
+        .bearer_auth(&second.secret)
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stolen.status(), 403);
+    let owned = http
+        .post(format!("{}/mcp", fixture.url))
+        .bearer_auth(&first.secret)
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(owned.status().is_success());
+}
+
+/// CLI flags reach useful local execution, including read alias, filters, research and collection mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_machine_flags_execute_successfully_against_live_fixtures() {
+    let pages = PagesFixture::new().await;
+    let root = std::env::temp_dir().join(format!("search-cli-machine-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings = root.join("settings.json");
+    std::fs::write(&settings, pages.settings().to_string()).unwrap();
+    let binary = env!("CARGO_BIN_EXE_search");
+    let url = format!("{}/docs/", pages.url);
+    let execute = |args: &[&str]| {
+        let output = local_command(binary, &root)
+            .args(args)
+            .args(["-config", settings.to_str().unwrap(), "-json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let read = execute(&["read", &url]);
+    assert_eq!(read[0]["text"].as_str().unwrap().chars().count(), 48);
+    assert_eq!(read[0]["next_offset"], 48);
+    let full = execute(&["fetch", &url, "-full", "-links"]);
+    assert!(full[0]["text"].as_str().unwrap().chars().count() > 1000);
+    assert!(full[0]["links"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(format!("{}/docs/child", pages.url))));
+    let found = execute(&[
+        "rust ownership",
+        "-language",
+        "en",
+        "-safe",
+        "false",
+        "-start-date",
+        "2024-02-29",
+        "-exact-phrase",
+        "rust ownership",
+    ]);
+    let forwarded: serde_json::Value =
+        serde_json::from_str(found["results"][0]["title"].as_str().unwrap()).unwrap();
+    assert_eq!(forwarded["language"], "en");
+    assert_eq!(forwarded["safe"], false);
+    assert_eq!(forwarded["start_date"], "2024-02-29");
+    let packet = execute(&[
+        "research",
+        "rust ownership",
+        "-sources",
+        "1",
+        "-max-attempts",
+        "2",
+        "-max-per-host",
+        "1",
+        "-total-chars",
+        "40",
+        "-timeout",
+        "10000",
+        "-session",
+        "cli-evidence",
+    ]);
+    assert_eq!(packet["coverage"]["read"], 1);
+    assert!(packet["characters"].as_u64().unwrap() <= 40);
+    let mapped = execute(&[
+        "map",
+        &url,
+        "-max-pages",
+        "2",
+        "-max-depth",
+        "1",
+        "-max-bytes",
+        "100000",
+        "-timeout",
+        "10000",
+        "-path-prefix",
+        "/docs/",
+    ]);
+    assert_eq!(mapped["urls"].as_array().unwrap().len(), 2);
+    assert!(mapped["pages"].as_array().unwrap().is_empty());
+    let disabled = local_command(binary, &root)
+        .args([
+            "research",
+            "rust",
+            "-synthesize",
+            "-config",
+            settings.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!disabled.status.success());
+    assert!(String::from_utf8_lossy(&disabled.stderr).contains("not configured"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Decode the tool response from either MCP JSON or a completed SSE message.
+async fn call_mcp(
+    http: &reqwest::Client,
+    origin: &str,
+    profile: &Remote,
+    session: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response = http.post(format!("{origin}/mcp")).bearer_auth(&profile.secret)
+        .header("Accept", "application/json, text/event-stream").header("mcp-session-id", session)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":arguments}}))
+        .send().await.unwrap();
+    assert!(response.status().is_success());
+    let body = response.text().await.unwrap();
+    let data = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .find(|data| !data.is_empty())
+        .unwrap_or(&body);
+    let value: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert!(value.get("error").is_none(), "{value}");
+    value["result"]["structuredContent"].clone()
+}
+
+/// MCP tools execute useful reads/research/inventory with the same device scope as paired REST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_machine_tools_share_read_defaults_research_scope_and_crawl_policy() {
+    let pages = PagesFixture::new().await;
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), pages.config()).await;
+    let profile = fixture.pair().await;
+    let http = client_api::client(&profile).unwrap();
+    let initialized = http.post(format!("{}/mcp",fixture.url)).bearer_auth(&profile.secret)
+        .header("Accept","application/json, text/event-stream")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"machine-test","version":"1"}}})).send().await.unwrap();
+    let session = initialized
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let notified = http
+        .post(format!("{}/mcp", fixture.url))
+        .bearer_auth(&profile.secret)
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .json(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(notified.status().is_success());
+    let url = format!("{}/docs/", pages.url);
+    let read = call_mcp(
+        &http,
+        &fixture.url,
+        &profile,
+        &session,
+        "web_fetch",
+        serde_json::json!({"urls":[url]}),
+    )
+    .await;
+    assert_eq!(
+        read["pages"][0]["text"].as_str().unwrap().chars().count(),
+        48
+    );
+    assert_eq!(read["pages"][0]["next_offset"], 48);
+    let full = call_mcp(
+        &http,
+        &fixture.url,
+        &profile,
+        &session,
+        "web_fetch",
+        serde_json::json!({"urls":[url],"full":true,"links":true}),
+    )
+    .await;
+    assert!(full["pages"][0]["text"].as_str().unwrap().chars().count() > 1000);
+    assert!(!full["pages"][0]["links"].as_array().unwrap().is_empty());
+    let search = call_mcp(
+        &http,
+        &fixture.url,
+        &profile,
+        &session,
+        "web_search",
+        serde_json::json!({"queries":["rust ownership"],"filters":{"language":"en","safe":false}}),
+    )
+    .await;
+    let forwarded: serde_json::Value = serde_json::from_str(
+        search["queries"][0]["results"][0]["title"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(forwarded["language"], "en");
+    assert_eq!(forwarded["safe"], false);
+    let evidence = call_mcp(&http,&fixture.url,&profile,&session,"web_research",serde_json::json!({"queries":["rust ownership"],"options":{"session":"mcp-rest-session","sources":2,"total_characters":120}})).await;
+    assert_eq!(evidence["coverage"]["read"], 2);
+    assert!(evidence["characters"].as_u64().unwrap() <= 120);
+    let repeated = Client::remote(profile.clone())
+        .unwrap()
+        .research(search::client::ResearchRequest {
+            queries: vec!["rust ownership".into()],
+            options: search::core::ResearchOptions {
+                session: Some("mcp-rest-session".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(repeated.coverage.read, 0);
+    assert_eq!(repeated.coverage.previously_seen, 2);
+    let crawl = call_mcp(
+        &http,
+        &fixture.url,
+        &profile,
+        &session,
+        "web_crawl",
+        serde_json::json!({"url":url,"path_prefix":"/docs/"}),
+    )
+    .await;
+    assert_eq!(crawl["pages"].as_array().unwrap().len(), 2);
+    let map = call_mcp(
+        &http,
+        &fixture.url,
+        &profile,
+        &session,
+        "web_map",
+        serde_json::json!({"url":url,"path_prefix":"/docs/"}),
+    )
+    .await;
+    assert!(map["pages"].as_array().unwrap().is_empty());
+    assert_eq!(map["urls"], crawl["urls"]);
+    assert_eq!(
+        pages
+            .blocked_hits
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Configured processing stays opt-in and produces identical audited local/host results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn research_processing_is_opt_in_and_runs_on_the_execution_host() {
+    let pages = PagesFixture::new().await;
+    let mut settings = pages.settings();
+    let command = |program: &str| serde_json::json!({"command":if cfg!(windows) {"python.exe"} else {"python3"},"args":["-c",program]});
+    settings["processing"] = serde_json::json!({
+        "reranker":command("import json,sys; r=json.load(sys.stdin); assert r['operation']=='rerank'; json.dump({'urls':[s['url'] for s in reversed(r['packet']['sources'])]},sys.stdout)"),
+        "synthesizer":command("import json,sys; r=json.load(sys.stdin); assert r['operation']=='synthesize'; json.dump({'answer':'Grounded fixture answer','citations':[r['packet']['sources'][0]['url']]},sys.stdout)")
+    });
+    let config: search::core::Config = serde_json::from_value(settings).unwrap();
+    let local = Client::Local(Arc::new(
+        search::core::Search::open(config.clone()).unwrap(),
+    ));
+    let fixture = Fixture::with_config(std::time::Duration::from_secs(900), config).await;
+    let remote = Client::remote(fixture.pair().await).unwrap();
+    for client in [local, remote] {
+        let request = search::client::ResearchRequest {
+            queries: vec!["rust ownership".into()],
+            ..Default::default()
+        };
+        let original = client.research(request.clone()).await.unwrap();
+        assert!(original.synthesis.is_none());
+        assert_eq!(original.sources[0].url, format!("{}/docs/", pages.url));
+        let processed = client
+            .research(search::client::ResearchRequest {
+                synthesize: true,
+                rerank: true,
+                ..request
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            processed.sources[0].url,
+            format!("{}/docs/child", pages.url)
+        );
+        assert_eq!(processed.characters, original.characters);
+        assert_eq!(processed.coverage.read, 2);
+        assert!(processed.processing_errors.is_empty());
+        let synthesis = processed.synthesis.unwrap();
+        assert!(synthesis.contains("Grounded fixture answer"));
+        assert!(synthesis.contains(&format!("{}/docs/child", pages.url)));
+    }
+}
+
+/// Character-window continuation must not hide an independently truncated download.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_read_reports_both_window_continuation_and_byte_truncation() {
+    let pages = PagesFixture::new().await;
+    let root = std::env::temp_dir().join(format!("search-cli-cut-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings = root.join("settings.json");
+    let mut config = pages.settings();
+    config["fetch"]["max_response_bytes"] = serde_json::json!(1024);
+    std::fs::write(&settings, config.to_string()).unwrap();
+    let output = local_command(env!("CARGO_BIN_EXE_search"), &root)
+        .args([
+            "read",
+            &format!("{}/docs/", pages.url),
+            "-max-chars",
+            "20",
+            "-config",
+            settings.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("continues; read on with -offset 20"),
+        "{text}"
+    );
+    assert!(
+        text.contains("truncated at fetch.max_response_bytes"),
+        "{text}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Query passage clipping exposes the offset and explains how to resume a plain read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_read_reports_clipped_passage_continuation() {
+    let pages = PagesFixture::new().await;
+    let root = std::env::temp_dir().join(format!("search-cli-passage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings = root.join("settings.json");
+    std::fs::write(&settings, pages.settings().to_string()).unwrap();
+    let output = local_command(env!("CARGO_BIN_EXE_search"), &root)
+        .args([
+            "read",
+            &format!("{}/docs/", pages.url),
+            "-query",
+            "ownership",
+            "-max-chars",
+            "20",
+            "-config",
+            settings.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("passage continues; read on without -query using -offset"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Human research output exposes incomplete evidence and engines that ignored a requested filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_research_reports_incomplete_evidence_and_unsupported_filters() {
+    let pages = PagesFixture::new().await;
+    let root = std::env::temp_dir().join(format!("search-cli-coverage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings = root.join("settings.json");
+    let mut config = pages.settings();
+    let url = format!("{}/docs/", pages.url);
+    config["engines"]["config"]["machine"]["version"] = serde_json::json!(1);
+    config["engines"]["config"]["machine"]["args"] = serde_json::json!([
+        "-c", format!("import json,sys; json.load(sys.stdin); json.dump({{'results':[{{'url':{url:?},'title':'Source'}}]}},sys.stdout)")
+    ]);
+    std::fs::write(&settings, config.to_string()).unwrap();
+    let output = local_command(env!("CARGO_BIN_EXE_search"), &root)
+        .args([
+            "research",
+            "ownership",
+            "-language",
+            "en",
+            "-chars",
+            "20",
+            "-total-chars",
+            "20",
+            "-config",
+            settings.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported filters: language"), "{stderr}");
+    assert!(
+        stderr.contains("research: incomplete evidence packet"),
+        "{stderr}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("search read URL -offset"));
     std::fs::remove_dir_all(root).unwrap();
 }

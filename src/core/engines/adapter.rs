@@ -12,7 +12,7 @@ use super::{Engine, EngineError, EngineFuture, Found};
 use crate::core::config::engines::http_url;
 use crate::core::config::{Adapter as Settings, Command, Http};
 use crate::core::fetch::guard::{check_host, GuardedResolver};
-use crate::core::Link;
+use crate::core::{Link, Query};
 
 /// An owned configured identifier and its query transport.
 pub(super) struct Adapter {
@@ -21,6 +21,7 @@ pub(super) struct Adapter {
 }
 
 /// HTTP owns a reusable guarded client; commands retain only their launch settings.
+#[allow(clippy::large_enum_variant)] // One startup transport per engine; boxing adds no useful bound.
 enum Transport {
     Http(Http, reqwest::Client),
     Command(Command),
@@ -57,27 +58,60 @@ impl Engine for Adapter {
     }
 
     fn search(&self, query: String, limit: usize) -> EngineFuture {
+        self.search_query(
+            Query {
+                text: query,
+                ..Default::default()
+            },
+            limit,
+        )
+    }
+
+    fn unsupported_filters(&self, filters: &crate::core::service::QueryFilters) -> Vec<String> {
+        filters
+            .values()
+            .into_keys()
+            .filter(|name| match &self.transport {
+                Transport::Http(settings, _) => !settings.filter_params.contains_key(name),
+                Transport::Command(settings) => settings.version == 1,
+            })
+            .collect()
+    }
+
+    fn search_query(&self, query: Query, limit: usize) -> EngineFuture {
         let name = self.name.clone();
         match &self.transport {
             Transport::Http(settings, client) => {
                 let settings = settings.clone();
                 let client = client.clone();
-                Box::pin(async move { http(&name, &settings, &client, &query, limit).await })
+                Box::pin(async move {
+                    http(
+                        &name,
+                        &settings,
+                        &client,
+                        &query.text,
+                        &query.filters,
+                        limit,
+                    )
+                    .await
+                })
             }
             Transport::Command(settings) => {
                 let settings = settings.clone();
-                Box::pin(async move { command(&name, &settings, &query, limit).await })
+                Box::pin(async move { command_query(&name, &settings, &query, limit).await })
             }
         }
     }
 }
 
-/// Dial only the configured endpoint; environment values are whole sensitive headers.
+/// Dial only the configured endpoint; requested filters replace static defaults,
+/// and environment values are whole sensitive headers.
 async fn http(
     name: &str,
     settings: &Http,
     client: &reqwest::Client,
     query: &str,
+    filters: &crate::core::service::QueryFilters,
     limit: usize,
 ) -> Result<Found, EngineError> {
     let mut url =
@@ -88,8 +122,17 @@ async fn http(
     )
     .map_err(|_| EngineError::network("engine endpoint refused"))?;
     {
-        let dynamic =
-            |key: &str| key == settings.query_param || settings.limit_param.as_deref() == Some(key);
+        let requested_filters = filters.values();
+        let dynamic = |key: &str| {
+            key == settings.query_param
+                || settings.limit_param.as_deref() == Some(key)
+                || requested_filters.keys().any(|field| {
+                    settings
+                        .filter_params
+                        .get(field)
+                        .is_some_and(|param| param == key)
+                })
+        };
         let mut values: Vec<(String, String)> = url
             .query_pairs()
             .into_owned()
@@ -106,6 +149,15 @@ async fn http(
         if let Some(param) = &settings.limit_param {
             values.push((param.clone(), limit.to_string()));
         }
+        for (field, filter_values) in requested_filters {
+            if let Some(param) = settings.filter_params.get(&field) {
+                values.extend(
+                    filter_values
+                        .into_iter()
+                        .map(|value| (param.clone(), value)),
+                );
+            }
+        }
         url.set_query(None);
         let mut params = url.query_pairs_mut();
         params.extend_pairs(&values);
@@ -120,11 +172,23 @@ async fn http(
         insert_header(&mut headers, key, &value, true)?;
     }
     let mut response = client
-        .get(url)
-        .headers(headers)
+        .get(url.clone())
+        .headers(headers.clone())
         .send()
         .await
         .map_err(|_| EngineError::network("engine HTTP request failed"))?;
+    if matches!(response.status().as_u16(), 429 | 503) {
+        if let Some(delay) = retry_delay(response.headers(), settings.retry_after_max) {
+            drop(response);
+            tokio::time::sleep(delay).await;
+            response = client
+                .get(url)
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|_| EngineError::network("engine HTTP request failed"))?;
+        }
+    }
     if !response.status().is_success() {
         return Err(EngineError::rejected(format!(
             "engine HTTP status {} rejected",
@@ -151,10 +215,81 @@ async fn http(
             title: &settings.title_pointer,
             url: &settings.url_pointer,
             snippet: &settings.snippet_pointer,
+            published: &settings.published_pointer,
+            snippets: &settings.snippets_pointer,
+            updated: &settings.updated_pointer,
             text_part: settings.text_part_pointer.as_deref(),
         },
         limit,
     )
+}
+
+/// Retry only when the entire server-requested delay fits the permitted wait.
+/// Oversized delays preserve the original rejection; existing deadlines cancel allowed waits.
+fn retry_delay(headers: &reqwest::header::HeaderMap, maximum: u64) -> Option<std::time::Duration> {
+    if maximum == 0 {
+        return None;
+    }
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let delay = match value.parse::<u64>() {
+        Ok(seconds) => std::time::Duration::from_secs(seconds),
+        Err(_) => http_date(value)?
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default(),
+    };
+    (delay <= std::time::Duration::from_millis(maximum)).then_some(delay)
+}
+
+/// Parse the standard IMF-fixdate Retry-After form without a new dependency.
+fn http_date(value: &str) -> Option<std::time::SystemTime> {
+    let parts: Vec<_> = value.split_ascii_whitespace().collect();
+    let [weekday, day, month, year, time, zone] = parts.as_slice() else {
+        return None;
+    };
+    if !["Mon,", "Tue,", "Wed,", "Thu,", "Fri,", "Sat,", "Sun,"].contains(weekday) || *zone != "GMT"
+    {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| m == month)? as i64
+        + 1;
+    let year: i64 = year.parse().ok()?;
+    let day: i64 = day.parse().ok()?;
+    let clock: Vec<_> = time.split(':').collect();
+    let [hour, minute, second] = clock.as_slice() else {
+        return None;
+    };
+    let (hour, minute, second) = (
+        hour.parse::<i64>().ok()?,
+        minute.parse::<i64>().ok()?,
+        second.parse::<i64>().ok()?,
+    );
+    let max_day = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1970..=9999).contains(&year)
+        || !(1..=max_day).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..60).contains(&second)
+    {
+        return None;
+    }
+    // Gregorian civil date to days since the Unix epoch.
+    let adjusted = year - i64::from(month <= 2);
+    let era = adjusted / 400;
+    let yoe = adjusted - era * 400;
+    let shifted = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * shifted + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(u64::try_from(seconds).ok()?))
 }
 
 /// Validate headers without including either their names or values in errors.
@@ -176,10 +311,30 @@ fn insert_header(
 /// Exchange one strict JSON document; dropping this future kills the direct child.
 /// `command` is absolute or a bare name found on `PATH`; settings resolution
 /// supplies an absolute working directory.
+#[cfg(test)]
 async fn command(
     name: &str,
     settings: &Command,
     query: &str,
+    limit: usize,
+) -> Result<Found, EngineError> {
+    command_query(
+        name,
+        settings,
+        &Query {
+            text: query.into(),
+            ..Default::default()
+        },
+        limit,
+    )
+    .await
+}
+
+/// Exchange a version-selected request, killing the direct child on cancellation.
+async fn command_query(
+    name: &str,
+    settings: &Command,
+    query: &Query,
     limit: usize,
 ) -> Result<Found, EngineError> {
     let cwd = settings
@@ -230,7 +385,16 @@ async fn command(
         .stdout
         .take()
         .ok_or_else(|| EngineError::network("engine command output unavailable"))?;
-    let mut request = serde_json::json!({"version": 1, "query": query, "limit": limit});
+    let mut request =
+        serde_json::json!({"version": settings.version, "query": query.text, "limit": limit});
+    if settings.version == 2 {
+        if let Some(object) = request.as_object_mut() {
+            object.insert(
+                "filters".into(),
+                serde_json::to_value(&query.filters).map_err(|_| malformed())?,
+            );
+        }
+    }
     if !settings.config.is_empty() {
         if let Some(object) = request.as_object_mut() {
             object.insert(
@@ -275,7 +439,18 @@ async fn command(
         ));
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
-    rows(name, &value, Mapping::COMMAND, limit)
+    let mut found = rows(name, &value, Mapping::COMMAND, limit)?;
+    if settings.version == 2 {
+        if let Some(value) = value.get("unsupported_filters") {
+            found.unsupported_filters = value
+                .as_array()
+                .ok_or_else(malformed)?
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned).ok_or_else(malformed))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
+    Ok(found)
 }
 
 /// JSON field locations; executable answers use the fixed protocol mapping.
@@ -284,6 +459,9 @@ struct Mapping<'a> {
     title: &'a str,
     url: &'a str,
     snippet: &'a str,
+    published: &'a str,
+    snippets: &'a str,
+    updated: &'a str,
     text_part: Option<&'a str>,
 }
 
@@ -293,6 +471,9 @@ impl Mapping<'_> {
         title: "/title",
         url: "/url",
         snippet: "/snippet",
+        published: "/published",
+        snippets: "/snippets",
+        updated: "/updated",
         text_part: None,
     };
 }
@@ -326,10 +507,37 @@ fn row(name: &str, row: &serde_json::Value, mapping: &Mapping<'_>) -> Option<Lin
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(mapped_text(value, mapping.text_part)?),
     };
+    // A date is grounding, not identity: a malformed one is simply omitted, and
+    // never fails the row the way a malformed snippet does.
+    let published = match row.pointer(mapping.published) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => mapped_text(value, mapping.text_part),
+    };
+    let mut snippets = match row.pointer(mapping.snippets) {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(|v| mapped_text(v, mapping.text_part))
+            .collect::<Option<Vec<_>>>()?,
+    };
+    let mut seen = std::collections::HashSet::new();
+    snippets.retain(|text| seen.insert(text.clone()));
+    if let Some(text) = &snippet {
+        if !snippets.contains(text) {
+            snippets.insert(0, text.clone());
+        }
+    }
+    let updated = row
+        .pointer(mapping.updated)
+        .and_then(|v| mapped_text(v, mapping.text_part));
     Some(Link {
         title,
         url: url.into(),
         snippet,
+        snippets,
+        updated,
+        published,
         engines: vec![name.into()],
         score: 0.0,
     })
@@ -380,6 +588,7 @@ mod tests {
     /// Python is only an offline executable fixture, never a production dependency.
     fn executable(script: &str, cap: u64) -> Command {
         Command {
+            version: 1,
             command: if cfg!(windows) {
                 "python.exe"
             } else {
@@ -846,6 +1055,9 @@ print(json.dumps({'results':[{'title':str(i),'url':'https://example.com/'+str(i)
             title: &mwmbl.title_pointer,
             url: &mwmbl.url_pointer,
             snippet: &mwmbl.snippet_pointer,
+            published: &mwmbl.published_pointer,
+            snippets: &mwmbl.snippets_pointer,
+            updated: &mwmbl.updated_pointer,
             text_part: mwmbl.text_part_pointer.as_deref(),
         };
         let found = rows("mwmbl", &value, mapping, 10).unwrap();
@@ -880,6 +1092,9 @@ print(json.dumps({'results':[{'title':str(i),'url':'https://example.com/'+str(i)
                 title: &http.title_pointer,
                 url: &http.url_pointer,
                 snippet: &http.snippet_pointer,
+                published: &http.published_pointer,
+                snippets: &http.snippets_pointer,
+                updated: &http.updated_pointer,
                 text_part: http.text_part_pointer.as_deref(),
             };
             let value = serde_json::from_str(saved).unwrap();
@@ -940,5 +1155,330 @@ print(json.dumps({'results':[{'title':str(i),'url':'https://example.com/'+str(i)
             .unwrap();
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    /// The complete v2 request reaches stdin literally; passages and dates survive mapping.
+    #[tokio::test]
+    async fn command_v2_carries_filters_and_multiple_passages() {
+        let mut settings = executable(
+            r#"
+import json,sys
+r=json.load(sys.stdin)
+assert r['version']==2
+assert r['query']=='literal query'
+assert r['filters']=={'freshness':'week','start_date':'2024-02-29','end_date':'2024-03-01','include_domains':['example.com'],'exclude_domains':['other.com'],'language':'en','region':'GB','category':'science','safe':False,'exact_phrase':'a & b'}
+print(json.dumps({'results':[{'title':'Article','url':'https://example.com/','snippet':'first','snippets':['first','second'],'published':'2024-02-29','updated':'2024-03-01'}]}))
+"#,
+            4096,
+        );
+        settings.version = 2;
+        let filters: crate::core::service::QueryFilters = serde_json::from_value(serde_json::json!({
+            "freshness":"week", "start_date":"2024-02-29", "end_date":"2024-03-01",
+            "include_domains":["example.com"], "exclude_domains":["other.com"],
+            "language":"en", "region":"GB", "category":"science", "safe":false, "exact_phrase":"a & b"
+        })).unwrap();
+        let adapter = Adapter::new("fixture".into(), Settings::Command(settings), "test").unwrap();
+        assert!(adapter.unsupported_filters(&filters).is_empty());
+        let found = adapter
+            .search_query(
+                Query {
+                    text: "literal query".into(),
+                    filters,
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.links[0].snippets, ["first", "second"]);
+        assert_eq!(found.links[0].updated.as_deref(), Some("2024-03-01"));
+        assert_eq!(found.links[0].published.as_deref(), Some("2024-02-29"));
+    }
+
+    /// Only configured HTTP filter mappings are transmitted; unsupported coverage is honest.
+    #[tokio::test]
+    async fn http_filter_parameters_override_static_values_and_report_unsupported() {
+        let (url, server) = socket_response("200 OK", r#"{"results":[]}"#, "").await;
+        let mut settings = http_settings(&format!("{url}?domains=stale&phrase=stale"));
+        settings.params.insert("domains".into(), "static".into());
+        settings
+            .filter_params
+            .insert("include_domains".into(), "domains".into());
+        settings
+            .filter_params
+            .insert("exact_phrase".into(), "phrase".into());
+        settings.filter_params.insert("safe".into(), "safe".into());
+        let pool = Pool::from_adapters(
+            vec![("fixture", Settings::Http(settings))],
+            Default::default(),
+        );
+        let answer = pool
+            .search(Query {
+                text: "query".into(),
+                filters: crate::core::service::QueryFilters {
+                    include_domains: vec!["a.example".into(), "b.example".into()],
+                    exact_phrase: Some("a & b".into()),
+                    safe: Some(false),
+                    start_date: Some("2024-02-29".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(answer.engines[0].unsupported_filters, ["start_date"]);
+        assert_eq!(answer.engines[0].status, EngineStatus::Ok);
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("domains=a.example&domains=b.example"),
+            "{request}"
+        );
+        assert!(request.contains("phrase=a+%26+b"));
+        assert!(request.contains("safe=false"));
+        assert!(
+            !request.contains("stale")
+                && !request.contains("static")
+                && !request.contains("start_date")
+        );
+    }
+
+    /// Merely declaring a mapping must not erase operator defaults when a
+    /// request omits the filter; explicit values still replace those defaults.
+    #[tokio::test]
+    async fn absent_filters_preserve_static_parameter_defaults() {
+        let (url, server) = socket_response("200 OK", r#"{"results":[]}"#, "").await;
+        let mut settings = http_settings(&format!("{url}?language=de&safe=true"));
+        settings.params.insert("language".into(), "en".into());
+        settings
+            .filter_params
+            .insert("language".into(), "language".into());
+        settings.filter_params.insert("safe".into(), "safe".into());
+        let pool = Pool::from_adapters(
+            vec![("fixture", Settings::Http(settings))],
+            Default::default(),
+        );
+        let answer = pool.search(Query::default()).await;
+        assert_eq!(answer.engines[0].status, EngineStatus::Ok);
+        let request = server.await.unwrap();
+        assert!(request.contains("safe=true"), "{request}");
+        assert!(request.contains("language=en"), "{request}");
+        assert!(!request.contains("language=de"), "{request}");
+    }
+
+    /// Explicit v1 stays byte-compatible and exposes every requested unsupported constraint.
+    #[tokio::test]
+    async fn legacy_command_reports_unsupported_filters() {
+        let settings = executable(
+            r#"
+import sys,json
+r=json.load(sys.stdin)
+assert r=={'version':1,'query':'q','limit':10}
+print('{"results":[]}')
+"#,
+            4096,
+        );
+        let pool = Pool::from_adapters(
+            vec![("legacy", Settings::Command(settings))],
+            Default::default(),
+        );
+        let answer = pool
+            .search(Query {
+                text: "q".into(),
+                filters: crate::core::service::QueryFilters {
+                    safe: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(answer.engines[0].status, EngineStatus::Ok);
+        assert_eq!(answer.engines[0].unsupported_filters, ["safe"]);
+    }
+
+    /// Serve a retryable rejection followed by success, recording every request.
+    async fn retry_server(
+        status: u16,
+        delay: &str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/search", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = count.clone();
+        let delay = delay.to_owned();
+        let task = tokio::spawn(async move {
+            for response in [format!("HTTP/1.1 {status} Rejected\r\nRetry-After: {delay}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"results\":[]}".into()] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") { socket.read_exact(&mut byte).await.unwrap(); request.push(byte[0]); }
+                recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, count, task)
+    }
+
+    /// Zero and short permitted pauses retry once without shortening the server delay.
+    #[tokio::test]
+    async fn http_retries_429_and_503_with_permitted_retry_after() {
+        for status in [429, 503] {
+            for (delay, minimum) in [
+                ("0", Duration::ZERO),
+                ("1", Duration::from_secs(1)),
+                ("Thu, 01 Jan 1970 00:00:00 GMT", Duration::ZERO),
+            ] {
+                let (url, count, server) = retry_server(status, delay).await;
+                let mut settings = http_settings(&url);
+                settings.retry_after_max = 1000;
+                let start = std::time::Instant::now();
+                let answer = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    query_http("retry", &settings, "q", 1),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(answer.is_empty());
+                assert!(start.elapsed() >= minimum);
+                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+                server.await.unwrap();
+            }
+        }
+    }
+
+    /// A valid delay beyond the wait budget returns the original status and sends no retry.
+    #[tokio::test]
+    async fn http_preserves_rejection_for_oversized_retry_after() {
+        for status in [429, 503] {
+            for delay in ["2", "Thu, 01 Jan 2099 00:00:00 GMT", "18446744073709551615"] {
+                let (url, count, server) = retry_server(status, delay).await;
+                let mut settings = http_settings(&url);
+                settings.retry_after_max = 20;
+                let error = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    query_http("retry", &settings, "q", 1),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert_eq!(error.cause, super::super::FailureCause::Rejected);
+                assert_eq!(
+                    error.message,
+                    format!("engine HTTP status {status} rejected")
+                );
+                // Observe beyond the old clamped wait to catch any early second request.
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+
+    /// Backoff sleep is cancelled at the engine deadline and when callers drop work.
+    #[tokio::test]
+    async fn backoff_deadline_and_cancellation_prevent_retry() {
+        for cancellation in [false, true] {
+            let (url, count, server) = retry_server(429, "1").await;
+            let mut settings = http_settings(&url);
+            settings.retry_after_max = 1000;
+            let adapter = Adapter::new("retry".into(), Settings::Http(settings), "test").unwrap();
+            let future = adapter.search("q".into(), 1);
+            if cancellation {
+                let task = tokio::spawn(future);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(tokio::time::timeout(Duration::from_millis(100), future)
+                    .await
+                    .is_err());
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
+    /// Retry-After supports both standard encodings and ignores malformed dates.
+    #[test]
+    fn retry_after_preserves_delays_and_rejects_excessive_waits() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (value, expected) in [
+            ("18446744073709551615", None),
+            ("0", Some(Duration::ZERO)),
+            ("1", None),
+            ("Thu, 01 Jan 2099 00:00:00 GMT", None),
+            ("Thu, 01 Jan 1970 00:00:00 GMT", Some(Duration::ZERO)),
+            ("bad", None),
+            ("Thu, 31 Feb 2099 00:00:00 GMT", None),
+        ] {
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            assert_eq!(retry_delay(&headers, 50), expected, "{value}");
+        }
+        headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
+        assert_eq!(retry_delay(&headers, 999), None);
+        assert_eq!(retry_delay(&headers, 1000), Some(Duration::from_secs(1)));
+        assert_eq!(retry_delay(&headers, 1001), Some(Duration::from_secs(1)));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "18446744073709551615".parse().unwrap(),
+        );
+        assert_eq!(retry_delay(&headers, u64::MAX), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Thu, 01 Jan 2099 00:00:00 GMT".parse().unwrap(),
+        );
+        let date = http_date("Thu, 01 Jan 2099 00:00:00 GMT").unwrap();
+        let before = std::time::SystemTime::now();
+        let delay = retry_delay(&headers, u64::MAX).unwrap();
+        let after = std::time::SystemTime::now();
+        assert!(delay <= date.duration_since(before).unwrap());
+        assert!(delay >= date.duration_since(after).unwrap());
+        assert_eq!(retry_delay(&headers, 0), None);
+        assert_eq!(
+            http_date("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(std::time::UNIX_EPOCH)
+        );
+    }
+    /// Command v2 may explicitly decline constraints; arbitrary response strings never escape.
+    #[tokio::test]
+    async fn command_v2_reports_declined_filters_without_leaking_unknown_values() {
+        let mut settings = executable(
+            r#"
+import json,sys
+json.load(sys.stdin)
+print(json.dumps({'results':[], 'unsupported_filters':['safe','secret-value','safe','language']}))
+"#,
+            4096,
+        );
+        settings.version = 2;
+        let pool = Pool::from_adapters(
+            vec![("fixture", Settings::Command(settings))],
+            Default::default(),
+        );
+        let answer = pool
+            .search(Query {
+                filters: crate::core::service::QueryFilters {
+                    safe: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(answer.engines[0].unsupported_filters, ["safe"]);
+        assert_eq!(answer.engines[0].status, EngineStatus::Ok);
+        assert!(!serde_json::to_string(&answer)
+            .unwrap()
+            .contains("secret-value"));
     }
 }

@@ -16,6 +16,7 @@ Usage: ./x COMMAND [args...]
   check   format check, lint, tests, shell syntax, and security guard (default)
   shell   check shell-script syntax
   guard   audit the security surface
+  eval    score labeled retrieval (--packets for replay, --binary for live)
   serve   build and run paired HTTPS hosting
   stdio   build and run MCP over stdio
   help    show this reference
@@ -54,12 +55,16 @@ case "$command" in
         cargo check --locked --no-default-features --test public_modules
         cargo check --locked --no-default-features --features mcp --test public_modules
         ./x test
+        PYTHONDONTWRITEBYTECODE=1 python3 tests/evaluate.py
         ./x shell
         ./x guard
         ;;
     guard)
         [ "$#" -eq 0 ] || usage >&2
         sh scripts/guard.sh
+        ;;
+    eval)
+        PYTHONDONTWRITEBYTECODE=1 exec python3 scripts/evaluate.py "$@"
         ;;
     # The shell scripts the release runs: a syntax error here fails a release,
     # not a pull request, so it belongs in check.

@@ -22,6 +22,20 @@ pub fn mount(
     search: Arc<Search>,
     allowed_host: &str,
 ) -> StreamableHttpService<Server, LocalSessionManager> {
+    mount_with_manager(
+        search,
+        allowed_host,
+        Arc::new(LocalSessionManager::default()),
+    )
+}
+
+/// Share the actual transport registry with host admission so expiring an
+/// authenticated session also closes its transport, rather than orphaning it.
+pub(crate) fn mount_with_manager(
+    search: Arc<Search>,
+    allowed_host: &str,
+    manager: Arc<LocalSessionManager>,
+) -> StreamableHttpService<Server, LocalSessionManager> {
     let mut hosts = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -43,7 +57,7 @@ pub fn mount(
         .with_sse_keep_alive(Some(std::time::Duration::from_secs(30)));
     StreamableHttpService::new(
         move || Ok(Server::new(Arc::clone(&search))),
-        Arc::new(LocalSessionManager::default()),
+        manager,
         config,
     )
 }

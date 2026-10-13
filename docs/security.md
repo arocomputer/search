@@ -36,6 +36,21 @@ assumes it is hostile:
 The one escape hatch, `allow_private_networks`, disables the guard for tests and
 air-gapped mirrors. Never set it on a reachable service.
 
+Byte limits bound retained response bodies, not peak parser memory or internal
+PDF decompression. Deadlines cancel callers and queued parsing, but cannot kill
+an already-running blocking parser; it retains its concurrency slot until it
+finishes. Hard CPU/memory isolation requires OS/process limits around the service.
+
+Collection traversal reuses this boundary for robots files, sitemaps, pages,
+HTTP redirects and meta refreshes. Every hop must also remain within the root
+origin and applicable path/robots scope. Traversal is bounded by total response
+bytes, page count, link depth, delay and the whole-call deadline. Missing robots
+files allow traversal; failed or incomplete policy reads fail closed. Robots
+rules are a politeness policy, not an authorization or content-trust mechanism.
+Outgoing links are returned only in a separate opt-in field, not reinserted into
+prose; image targets are excluded. Consumers should not render that URL inventory
+as automatically loaded resources.
+
 ## Untrusted content
 
 Engines and settings are operator-owned, not model-chosen request fields.
@@ -55,8 +70,10 @@ A fetched page is untrusted content, and the cheapest place to hide an
 instruction aimed at a model is text a person never sees. Extraction removes
 visually hidden text — inline `display:none`/`visibility:hidden`/`opacity:0`,
 the `hidden` attribute, `aria-hidden`, screen-reader class names, and off-screen
-positioning — and neutralizes Markdown link/image targets, including nested
-syntax and non-HTML text responses. The remaining text is passed to the model
+positioning — and neutralizes Markdown image/reference targets, including nested
+syntax and non-HTML text responses. Extracted prose also loses ordinary link
+targets; literal source text keeps code layout and breaks active HTML image tags.
+The remaining text is passed to the model
 as data, in a clearly delimited field. This is defense in depth, not a guarantee
 against prompt injection; consumers must not interpret source text as instructions.
 Human CLI output also strips terminal control characters from untrusted fields;
@@ -65,6 +82,19 @@ JSON retains the original data.
 Search can fetch public pages and caches recent pages transiently in memory.
 Paired devices are trusted to initiate searches and fetches; extracted content
 still must be treated as data by the consuming model.
+
+Research sessions retain only bounded, expiring identities/hashes, not an index
+or page corpus. Paired HTTP session keys are namespaced by device identity; MCP
+transport sessions are bound to the credential that created them. Sharing a
+human-readable session label does not grant another device access to its state.
+
+Optional rerankers and synthesizers have the same trusted-host-code limitations
+as command engines. They receive a packet only on explicit request, have bounded
+I/O and shared concurrency admission, and their direct child is killed on cancellation.
+Admission and both processing stages share a budget within the research deadline.
+Declared citations must belong to successfully returned evidence, but that is
+not a proof that generated claims follow from those passages. Source text and
+processor output remain untrusted data.
 
 ## Authentication
 

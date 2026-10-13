@@ -9,7 +9,10 @@
 mod defaults;
 pub(crate) mod engines;
 mod load;
+mod machine;
 mod settings;
+
+pub use machine::{CrawlSettings, ProcessingSettings, ResearchSettings};
 
 pub use engines::{valid_engine_id, Preset, DEFAULT_ENGINE, PRESETS};
 pub use settings::{

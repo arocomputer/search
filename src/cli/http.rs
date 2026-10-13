@@ -7,15 +7,15 @@
 use std::sync::Arc;
 
 use crate::core::{Query, Search};
-use crate::mcp::mount as mount_mcp;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::{Json, Router};
 
 use crate::cli::{auth::Host, run::build_service};
-use crate::client::{validate_search, validate_urls};
+use crate::client::{Client, DeviceIdentity, ReadRequest, ResearchRequest};
 
 /// Host the local engine behind paired HTTPS until interrupted.
 pub async fn serve(
@@ -118,28 +118,95 @@ pub async fn serve(
 
 /// Protect every execution route; `allowed_host` is the advertised MCP authority.
 pub fn router(service: Arc<Search>, host: Arc<Host>, allowed_host: &str) -> Router {
-    let mcp = mount_mcp(Arc::clone(&service), allowed_host);
+    let manager = Arc::new(
+        rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+    );
+    let mcp = crate::mcp::mount_with_manager(Arc::clone(&service), allowed_host, manager.clone());
+    let authorization = Arc::new(Authorization {
+        host: Arc::clone(&host),
+        sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        ttl: std::time::Duration::from_millis(service.config().research.session_ttl),
+        slots: Arc::new(tokio::sync::Semaphore::new(
+            service.config().research.session_entries,
+        )),
+        capacity: service.config().research.session_entries,
+        manager,
+    });
     let protected = Router::new()
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/search", get(search))
+        .route("/v1/search", get(search).post(search_post))
         .route("/v1/fetch", post(fetch))
+        .route("/v1/research", post(research))
+        .route("/v1/crawl", post(crawl))
+        .route("/v1/map", post(map))
         .nest_service("/mcp", mcp)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&host),
-            auth,
-        ))
+        .layer(axum::middleware::from_fn_with_state(authorization, auth))
         .with_state(service);
     protected
         .merge(Router::new().route("/pair", post(pair)).with_state(host))
         .layer(axum::extract::DefaultBodyLimit::max(1 << 20))
 }
 
-/// Refuse browser-origin requests and accept only currently registered device secrets.
+/// Bind MCP transport sessions to authenticated devices; state expires and is bounded.
+struct Authorization {
+    host: Arc<Host>,
+    sessions: std::sync::Mutex<std::collections::HashMap<String, TransportOwner>>,
+    ttl: std::time::Duration,
+    slots: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+    manager: Arc<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
+}
+
+/// A live transport owns one admission slot until deletion or expiry.
+struct TransportOwner {
+    identity: String,
+    touched: std::time::Instant,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Authorization {
+    /// Remove expired ownership and close its real MCP transport before allowing
+    /// replacement initialization. No registry lock is held across async work.
+    async fn expire(self: &Arc<Self>) -> Result<(), ()> {
+        let live = self.manager.sessions.read().await;
+        use rmcp::transport::streamable_http_server::SessionManager;
+        let expired = {
+            let mut sessions = self.sessions.lock().map_err(|_| ())?;
+            let keys: Vec<String> = sessions
+                .iter()
+                .filter(|(key, owner)| {
+                    !live.contains_key(key.as_str())
+                        || (!self.ttl.is_zero() && owner.touched.elapsed() >= self.ttl)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| sessions.remove(&key).map(|owner| (key, owner)))
+                .collect::<Vec<_>>()
+        };
+        drop(live);
+        if expired.is_empty() {
+            return Ok(());
+        }
+        let manager = self.manager.clone();
+        // Cleanup must finish even if the request that triggered expiry disconnects.
+        tokio::spawn(async move {
+            for (key, owner) in expired {
+                let _ = manager.close_session(&Arc::from(key)).await;
+                drop(owner);
+            }
+        })
+        .await
+        .map_err(|_| ())
+    }
+}
+
+/// Refuse browser requests, verify credentials and bind MCP sessions to their owners.
 async fn auth(
-    State(host): State<Arc<Host>>,
+    State(authorization): State<Arc<Authorization>>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     if headers.contains_key(axum::http::header::ORIGIN) {
@@ -150,10 +217,126 @@ async fn auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if !host.authorized(presented) {
+    if !authorization.host.authorized(presented) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    next.run(request).await
+    // Identity comes only from a verified secret; never trust device IDs in input.
+    let namespace = crate::client::session_namespace(presented);
+    let mcp = request.uri().path() == "/mcp" || request.uri().path().starts_with("/mcp/");
+    let mut admission = None;
+    if mcp {
+        if authorization.expire().await.is_err() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if let Some(session) = headers.get("mcp-session-id") {
+            let Ok(session) = session.to_str() else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            let Ok(mut sessions) = authorization.sessions.lock() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            match sessions.get_mut(session) {
+                Some(owner) if owner.identity == namespace => {
+                    owner.touched = std::time::Instant::now()
+                }
+                _ => return StatusCode::FORBIDDEN.into_response(),
+            }
+        } else {
+            // Include transports still shutting down after a failed initialization.
+            if authorization.manager.sessions.read().await.len() >= authorization.capacity {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            // Reserve BEFORE the transport factory runs, including concurrent
+            // initialization. The lifecycle task retains it through cancellation.
+            match authorization.slots.clone().try_acquire_owned() {
+                Ok(slot) => admission = Some(slot),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+    }
+    request
+        .extensions_mut()
+        .insert(DeviceIdentity(namespace.clone()));
+    let deleted_session = (mcp && request.method() == axum::http::Method::DELETE)
+        .then(|| {
+            headers
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .flatten();
+    if !mcp {
+        return next.run(request).await;
+    }
+    mcp_response(
+        authorization,
+        namespace,
+        admission,
+        deleted_session,
+        next.run(request),
+    )
+    .await
+}
+
+/// Finish transport ownership and deletion independently of HTTP cancellation.
+/// If initialization loses its caller, close the new transport before releasing capacity.
+async fn mcp_response(
+    authorization: Arc<Authorization>,
+    namespace: String,
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    deleted_session: Option<String>,
+    response: impl std::future::Future<Output = Response> + Send + 'static,
+) -> Response {
+    if admission.is_none() && deleted_session.is_none() {
+        return response.await;
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        use rmcp::transport::streamable_http_server::SessionManager;
+        let response = response.await;
+        let initialized_session = admission.as_ref().and_then(|_| {
+            response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+        if response.status().is_success() {
+            if let Some(session) = &initialized_session {
+                if let Ok(mut sessions) = authorization.sessions.lock() {
+                    if let Some(slot) = admission {
+                        sessions.insert(
+                            session.clone(),
+                            TransportOwner {
+                                identity: namespace,
+                                touched: std::time::Instant::now(),
+                                _slot: slot,
+                            },
+                        );
+                    }
+                }
+            }
+            if let Some(session) = deleted_session {
+                if let Ok(mut sessions) = authorization.sessions.lock() {
+                    sessions.remove(&session);
+                }
+            }
+        }
+        if sender.send(response).is_err() {
+            if let Some(session) = initialized_session {
+                let _ = authorization
+                    .manager
+                    .close_session(&Arc::from(session.clone()))
+                    .await;
+                if let Ok(mut sessions) = authorization.sessions.lock() {
+                    sessions.remove(&session);
+                }
+            }
+        }
+    });
+    receiver
+        .await
+        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }
 
 /// A pairing request carries the one-time code, never an existing device credential.
@@ -205,32 +388,69 @@ async fn search(
                 .collect()
         })
         .unwrap_or_default();
-    let query = match validate_search(Query {
-        text: params.q,
-        limit: params.limit.unwrap_or(0),
-        engines,
-    }) {
-        Ok(query) => query,
-        Err(message) => return bad_request(&message),
-    };
-    Json(service.search(query).await).into_response()
+    search_post(
+        State(service),
+        Json(Query {
+            text: params.q,
+            limit: params.limit.unwrap_or(0),
+            engines,
+            ..Default::default()
+        }),
+    )
+    .await
 }
 
-/// Body for the fetch endpoint.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FetchBody {
-    urls: Vec<String>,
-}
-
-/// `POST /v1/fetch`: `{"pages": [Page...]}` in input order; per-URL failures
-/// are reported on each page rather than failing the request.
-async fn fetch(State(service): State<Arc<Search>>, Json(body): Json<FetchBody>) -> Response {
-    if let Err(message) = validate_urls(&body.urls) {
-        return bad_request(&message);
+/// `POST /v1/search` preserves the full directional query shape.
+async fn search_post(State(service): State<Arc<Search>>, Json(query): Json<Query>) -> Response {
+    match Client::Local(service).search(query).await {
+        Ok(answer) => Json(answer).into_response(),
+        Err(message) => bad_request(&message),
     }
-    let pages = service.fetch(&body.urls).await;
-    Json(serde_json::json!({ "pages": pages })).into_response()
+}
+
+/// `POST /v1/fetch` returns bounded reads; full content and links are opt-in.
+async fn fetch(State(service): State<Arc<Search>>, Json(body): Json<ReadRequest>) -> Response {
+    match Client::Local(service).read(body).await {
+        Ok(pages) => Json(serde_json::json!({ "pages": pages })).into_response(),
+        Err(message) => bad_request(&message),
+    }
+}
+
+/// `POST /v1/research` resolves host defaults and scopes sessions per device.
+async fn research(
+    State(service): State<Arc<Search>>,
+    Extension(identity): Extension<DeviceIdentity>,
+    Json(body): Json<ResearchRequest>,
+) -> Response {
+    match Client::scoped_local(service, identity.0)
+        .research(body)
+        .await
+    {
+        Ok(packet) => Json(packet).into_response(),
+        Err(message) => bad_request(&message),
+    }
+}
+
+/// `POST /v1/crawl` applies the host's guarded inventory policy.
+async fn crawl(
+    State(service): State<Arc<Search>>,
+    Json(body): Json<crate::core::CrawlRequest>,
+) -> Response {
+    match Client::Local(service).crawl(body).await {
+        Ok(report) => Json(report).into_response(),
+        Err(message) => bad_request(&message),
+    }
+}
+
+/// `POST /v1/map` uses the same bounded crawler with inventory-only output.
+async fn map(
+    State(service): State<Arc<Search>>,
+    Json(body): Json<crate::core::CrawlRequest>,
+) -> Response {
+    match Client::Local(service).map(body).await {
+        Ok(report) => Json(report).into_response(),
+        Err(message) => bad_request(&message),
+    }
 }
 
 /// `GET /v1/status`: the host version and its selected engine names.
@@ -254,4 +474,144 @@ fn bad_request(message: &str) -> Response {
         Json(serde_json::json!({ "error": message })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::SessionManager;
+
+    /// Isolate the real transport manager and one-slot admission registry for lifecycle tests.
+    fn authorization() -> (Arc<Authorization>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("search-admission-{}", uuid::Uuid::new_v4()));
+        let authorization = Arc::new(Authorization {
+            host: Arc::new(
+                Host::open(&root, "localhost", std::time::Duration::from_secs(60)).unwrap(),
+            ),
+            sessions: std::sync::Mutex::new(Default::default()),
+            ttl: std::time::Duration::from_secs(60),
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            capacity: 1,
+            manager: Arc::new(LocalSessionManager::default()),
+        });
+        (authorization, root)
+    }
+
+    /// Cancelling an initialization retains admission until its orphan transport is closed.
+    #[tokio::test]
+    async fn cancelled_initialization_closes_transport_before_releasing_admission() {
+        let (authorization, root) = authorization();
+        let slot = authorization.slots.clone().try_acquire_owned().unwrap();
+        let (session, _transport) = authorization.manager.create_session().await.unwrap();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let response = {
+            let ready = ready.clone();
+            let finish = finish.clone();
+            let session = session.clone();
+            async move {
+                ready.notify_one();
+                finish.notified().await;
+                let mut response = StatusCode::OK.into_response();
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", session.parse().unwrap());
+                response
+            }
+        };
+        let request = tokio::spawn(mcp_response(
+            authorization.clone(),
+            "device".into(),
+            Some(slot),
+            None,
+            response,
+        ));
+        ready.notified().await;
+        request.abort();
+        let _ = request.await;
+        assert_eq!(authorization.slots.available_permits(), 0);
+        finish.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while authorization.slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!authorization.manager.has_session(&session).await.unwrap());
+        assert!(authorization.sessions.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// rmcp can close an idle transport earlier than host TTL; its admission must be reusable.
+    #[tokio::test]
+    async fn expiry_releases_ownership_for_already_closed_transports() {
+        let (authorization, root) = authorization();
+        let (session, _transport) = authorization.manager.create_session().await.unwrap();
+        let slot = authorization.slots.clone().try_acquire_owned().unwrap();
+        authorization.sessions.lock().unwrap().insert(
+            session.to_string(),
+            TransportOwner {
+                identity: "device".into(),
+                touched: std::time::Instant::now(),
+                _slot: slot,
+            },
+        );
+        authorization.manager.close_session(&session).await.unwrap();
+        authorization.expire().await.unwrap();
+        assert_eq!(authorization.slots.available_permits(), 1);
+        assert!(authorization.sessions.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A disconnect after transport deletion cannot strand the corresponding ownership slot.
+    #[tokio::test]
+    async fn cancelled_deletion_still_releases_admission() {
+        let (authorization, root) = authorization();
+        let (session, _transport) = authorization.manager.create_session().await.unwrap();
+        let slot = authorization.slots.clone().try_acquire_owned().unwrap();
+        authorization.sessions.lock().unwrap().insert(
+            session.to_string(),
+            TransportOwner {
+                identity: "device".into(),
+                touched: std::time::Instant::now(),
+                _slot: slot,
+            },
+        );
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let response = {
+            let manager = authorization.manager.clone();
+            let ready = ready.clone();
+            let finish = finish.clone();
+            let session = session.clone();
+            async move {
+                manager.close_session(&session).await.unwrap();
+                ready.notify_one();
+                finish.notified().await;
+                StatusCode::OK.into_response()
+            }
+        };
+        let request = tokio::spawn(mcp_response(
+            authorization.clone(),
+            "device".into(),
+            None,
+            Some(session.to_string()),
+            response,
+        ));
+        ready.notified().await;
+        request.abort();
+        let _ = request.await;
+        finish.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while authorization.slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(authorization.sessions.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

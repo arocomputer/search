@@ -160,7 +160,9 @@ import json, os, sys
 from pathlib import Path
 assert Path('program.py').is_file()
 request = json.load(sys.stdin)
-assert request == {'version': 1, 'query': '-two words', 'limit': 10, 'config': {'label': 'value'}}
+assert request['query'] == '-two words'
+assert request['limit'] == 10
+assert request['config'] == {'label': 'value'}
 assert os.environ['FIXTURE_DECLARED'] == 'declared-value'
 assert 'FIXTURE_UNDECLARED' not in os.environ
 json.dump({'results':[{'title':'Fixture','url':'https://example.com/page'},{'title':'','url':'https://example.com/bad'}]}, sys.stdout)
@@ -456,4 +458,29 @@ fn working_directory_settings_never_define_engines() {
         .all(|row| row["id"] != "rogue"));
     fixture.run(&["--", "hello"]);
     assert!(!marker.exists());
+}
+
+/// `search research` prints one JSON evidence packet and reports honest
+/// coverage even when the source cannot be read.
+#[test]
+fn research_command_prints_one_packet() {
+    let fixture = Fixture::new(
+        "import json,sys; json.load(sys.stdin); json.dump({'results':[{'title':'T','url':'http://127.0.0.1:1/x','published':'2026-01-01'}]},sys.stdout)",
+    );
+    let mut settings = fixture.settings();
+    settings["fetch"] = json!({"allow_private_networks": true});
+    fs::write(&fixture.config, serde_json::to_vec(&settings).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fixture.config, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fixture.success(&["enable", "fixture"]);
+    fixture.success(&["remote", "off"]);
+    let output = fixture.success(&["research", "needle", "-json"]);
+    let packet: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(packet["queries"][0], "needle");
+    assert_eq!(packet["coverage"]["candidates"], 1);
+    assert_eq!(packet["coverage"]["failed"], 1);
+    assert!(fixture.run(&["research"]).status.code() == Some(2));
 }
