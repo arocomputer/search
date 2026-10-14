@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Refuse only the `3fff::/20` IPv6 documentation range (RFC 9637) instead of the
+  whole `3ff0::/12`, so public addresses just outside it are reachable again.
 - Review hardening: processors share bounded admission and one deadline within
   the research budget, report end-to-end latency, and use command-engine working
   directory defaults. Invalid fetch concurrency is rejected before startup.
@@ -194,8 +196,8 @@
   across Search releases. Document the shared store/runtime for shipped and
   custom engines and protect installed custom packages with a compatibility test.
 - Bound paired-host responses with `remote.max_response_bytes` (default 64 MiB)
-  and align CLI focused reads with the 6000-character MCP default. Explicit CLI
-  character limits must be 1–40000; unmatched queries fall back to page text.
+  and align CLI focused reads with the 6000-character MCP default. Unmatched
+  queries fall back to page text.
 - Engine management commands reserve their first word; use `search -- QUERY`
   when a literal query begins with a command name.
 - Bound ephemeral fetch caching with `fetch.cache_bytes` (default 32 MiB),
@@ -217,8 +219,8 @@
   MCP owns only tools and transports. Retain optional paired HTTPS hosting and
   remote routing without local fallback.
 - MCP fetch with no query or character limit returns the full clean page under
-  the fetch transport body bound. Explicit `max_characters` accepts 1–40000;
-  query-focused reads default to 6000 characters per page.
+  the fetch transport body bound, with query-focused reads defaulting to 6000
+  characters per page.
 - Reduce the shipped catalog to Mwmbl and SearXNG. Remove vendor API and scraper
   packages and their helpers; existing installed packages/settings are untouched.
   Custom HTTP and command engines still merge concurrently. Document AI/API
