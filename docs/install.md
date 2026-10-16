@@ -28,7 +28,7 @@ runtime verification.
 Download and review the script before running it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fschrhunt/search/main/install.sh -o install-search.sh
+curl -fsSL https://raw.githubusercontent.com/arocomputer/search/main/install.sh -o install-search.sh
 less install-search.sh
 sh install-search.sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -55,7 +55,7 @@ the script and trust the release source before running downloaded code.
 In PowerShell, download and inspect the installer before running it:
 
 ```powershell
-Invoke-WebRequest https://raw.githubusercontent.com/fschrhunt/search/main/install.ps1 -OutFile install-search.ps1
+Invoke-WebRequest https://raw.githubusercontent.com/arocomputer/search/main/install.ps1 -OutFile install-search.ps1
 Get-Content ./install-search.ps1
 ./install-search.ps1
 ```
@@ -77,7 +77,7 @@ ACLs. `SEARCH_HOME` can select another absolute location.
 ## Homebrew
 
 ```sh
-brew tap fschrhunt/search https://github.com/fschrhunt/search
+brew tap arocomputer/search https://github.com/arocomputer/search
 brew install search
 ```
 
@@ -87,7 +87,7 @@ Install Git, rustup, and your platform's C linker/build tools first. Rustup
 installs the toolchain pinned in `rust-toolchain.toml` on the first build.
 
 ```sh
-git clone https://github.com/fschrhunt/search
+git clone https://github.com/arocomputer/search
 cd search
 ./x build --release
 ./target/release/search version
