@@ -1354,14 +1354,14 @@ mod tests {
 
     #[test]
     fn robots_selects_product_name_without_version_or_contact_url() {
-        let rules = test_robots("User-agent: *\nDisallow: /\nUser-agent: github\nAllow: /\nUser-agent: preview\nAllow: /", "Search/preview (+https://github.com/fschrhunt/search)");
+        let rules = test_robots("User-agent: *\nDisallow: /\nUser-agent: github\nAllow: /\nUser-agent: preview\nAllow: /", "Search/preview (+https://github.com/arocomputer/search)");
         assert!(!test_allowed(
             &rules,
             &Url::parse("https://example.com/").unwrap()
         ));
         let rules = test_robots(
             "User-agent: *\nDisallow: /\nUser-agent: SEARCH\nAllow: /",
-            "Search/preview (+https://github.com/fschrhunt/search)",
+            "Search/preview (+https://github.com/arocomputer/search)",
         );
         assert!(test_allowed(
             &rules,

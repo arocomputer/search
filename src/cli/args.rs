@@ -270,7 +270,7 @@ Settings:
   -config PATH                    settings file; before or after the command/query
   Default: $CONFIG or $SEARCH_HOME/settings.json (SEARCH_HOME defaults to ~/.search).
   Double-dash flag forms are accepted. Use -- before literal query/value arguments.
-  Guide: https://github.com/fschrhunt/search/tree/main/docs"
+  Guide: https://github.com/arocomputer/search/tree/main/docs"
 }
 
 /// Parse engine commands, extracting flags before literal `--` arguments.

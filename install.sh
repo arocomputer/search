@@ -3,13 +3,13 @@
 # against the release's checksums, into ~/.local/bin (or $SEARCH_INSTALL_DIR).
 # Run it again to update.
 #
-#   curl -fsSL https://raw.githubusercontent.com/fschrhunt/search/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/fschrhunt/search/main/install.sh | sh -s -- --version v0.1.0
+#   curl -fsSL https://raw.githubusercontent.com/arocomputer/search/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/arocomputer/search/main/install.sh | sh -s -- --version v0.1.0
 #
-# $SEARCH_RELEASES replaces https://github.com/fschrhunt/search/releases, for testing.
+# $SEARCH_RELEASES replaces https://github.com/arocomputer/search/releases, for testing.
 set -eu
 
-releases=${SEARCH_RELEASES:-https://github.com/fschrhunt/search/releases}
+releases=${SEARCH_RELEASES:-https://github.com/arocomputer/search/releases}
 dir=${SEARCH_INSTALL_DIR:-$HOME/.local/bin}
 version=${SEARCH_VERSION:-}
 
