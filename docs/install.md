@@ -15,7 +15,7 @@ or its shipped HTTP engines.
 | --- | --- |
 | Linux | `search`, GNU/glibc builds on Ubuntu 24.04; older glibc and musl distributions need a source build |
 | macOS | `search`, release deployment target macOS 11; CI runs current macOS runners, not every older OS version |
-| Windows | `search.exe`, Windows 10/11 with local NTFS storage for private settings, packages, and trust; release builds statically link the C runtime |
+| Windows | `search.exe`, Windows 10/11 with local NTFS storage for private settings, engine scratch, and trust; release builds statically link the C runtime |
 
 These targets are not a promise to support every OS version, filesystem, or CPU.
 The native CI matrix must pass before release; cross-compilation alone is not

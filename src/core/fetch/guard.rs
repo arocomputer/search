@@ -233,7 +233,7 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         // 2001:2::/48 benchmarking
         0x2001 if segments[1] == 0x0002 => false,
         // 3fff::/20 documentation (RFC 9637)
-        0x3ff0..=0x3fff => false,
+        0x3fff if segments[1] <= 0x0fff => false,
         _ => true,
     }
 }
@@ -290,7 +290,8 @@ mod tests {
             "::127.0.0.1",              // IPv4-compatible
             "2001::1",                  // Teredo
             "2001:db8::1",              // documentation
-            "3fff::1",                  // documentation (RFC 9637)
+            "3fff::1",                  // documentation (RFC 9637), bottom of /20
+            "3fff:0fff:ffff::1",        // top of the 3fff::/20 documentation range
         ];
         for address in private {
             assert!(!is_public_ip(ip(address)), "{address} should be private");
@@ -309,6 +310,9 @@ mod tests {
             "::ffff:8.8.8.8",
             // The well-known translation layout can safely classify its IPv4.
             "64:ff9b::101:101", // well-known NAT64 -> 1.1.1.1
+            // Only 3fff::/20 is documentation; neighbours stay publicly routable.
+            "3ffe::1",      // outside the 3fff::/20 range
+            "3fff:1000::1", // first address past the 3fff::/20 range
         ];
         for address in public {
             assert!(is_public_ip(ip(address)), "{address} should be public");

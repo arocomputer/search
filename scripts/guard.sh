@@ -8,11 +8,11 @@ cd "$(dirname "$0")/.."
 fail=0
 
 say() { printf '%s\n' "$*"; }
-bad() { fail=1; say "FAIL: $*"; }
+bad() { fail=1; printf '%s\n' "$*" | sed 's/^/FAIL: /'; }
 
-# The shipped Rust sources: everything under src, minus test modules.
-# A `#[cfg(test)]` module is the last item in a file, so truncating at the first
-# marker removes it. Without this, test fixtures trip boundaries meant for the
+# The shipped Rust files: everything under src. Each consumer truncates a file at
+# the first `#[cfg(test)]` marker, which assumes the test module is the last item
+# in the file. Without that, test fixtures would trip boundaries meant for the
 # shipped binary.
 prod_sources() {
     find src -type f -name '*.rs'
@@ -54,7 +54,7 @@ for f in $(prod_sources); do
                     prev2 = lines[n-2]
                     if (prev !~ /clippy::expect_used|clippy::unwrap_used|proof:/ &&
                         prev2 !~ /clippy::expect_used|clippy::unwrap_used|proof:/) {
-                        printf "FAIL: %s:%d: explicit panic site without a proof comment\n", file, n
+                        printf "%s:%d: explicit panic site without a proof comment\n", file, n
                     }
                 }
             }
