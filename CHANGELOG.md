@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 · 2026-10-16
 
 - Refuse only the `3fff::/20` IPv6 documentation range (RFC 9637) instead of the
   whole `3ff0::/12`, so public addresses just outside it are reachable again.
