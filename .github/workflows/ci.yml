@@ -1,7 +1,7 @@
 name: CI
 
-# What a pull request must pass. Local checks run the same commands through `./x`,
-# so no environment has a private definition of "green".
+# PRs run the full suite on Linux and native tests on macOS/Windows. The default
+# branch runs the full six-platform matrix; releases repeat native build/install checks.
 on:
   pull_request:
   push:
@@ -18,21 +18,27 @@ jobs:
       matrix:
         include:
           - name: Linux
+            pr: true
             os: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
           - name: Linux (ARM64)
+            pr: false
             os: ubuntu-24.04-arm
             triple: aarch64-unknown-linux-gnu
           - name: macOS (Apple Silicon)
+            pr: true
             os: macos-latest
             triple: aarch64-apple-darwin
           - name: macOS (Intel)
+            pr: false
             os: macos-15-intel
             triple: x86_64-apple-darwin
           - name: Windows
+            pr: true
             os: windows-latest
             triple: x86_64-pc-windows-msvc
           - name: Windows (ARM64)
+            pr: false
             os: windows-11-arm
             triple: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -43,49 +49,64 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request' || matrix.pr
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        if: github.event_name != 'pull_request' || matrix.pr
         with:
           toolchain: 1.98.0-${{ matrix.triple }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.event_name != 'pull_request' || matrix.pr
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event_name != 'pull_request' || matrix.pr
         with:
           python-version: '3.13'
           architecture: ${{ startsWith(matrix.triple, 'aarch64') && 'arm64' || 'x64' }}
       - name: Verify native Rust host
+        if: github.event_name != 'pull_request' || matrix.pr
         env:
           TRIPLE: ${{ matrix.triple }}
         run: |
           test "$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')" = "$TRIPLE"
       - name: Select a user-owned Windows test temp directory
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (github.event_name != 'pull_request' || matrix.pr)
         shell: pwsh
         run: |
           $temp = Join-Path $env:LOCALAPPDATA 'Temp'
           New-Item -ItemType Directory -Path $temp -Force | Out-Null
           "SEARCH_TEST_TEMP=$temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - run: ./x check
+      - name: Full checks on Linux PRs and every default-branch push
+        if: matrix.name == 'Linux' || github.event_name == 'push'
+        run: ./x check
         env:
           # Avoid macOS's /var -> /private/var alias in security-sensitive fixtures.
           # Windows's shared runner temp need not have trustworthy ACLs/ownership.
           TMPDIR: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
           TMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
           TEMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
+      - name: Native tests on macOS and Windows PRs
+        if: github.event_name == 'pull_request' && matrix.pr && matrix.name != 'Linux'
+        run: ./x test
+        env:
+          TMPDIR: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
+          TMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
+          TEMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
       - name: Build the native release profile
+        if: github.event_name == 'push'
         run: ./x build --release --target "$TRIPLE"
         env:
           TRIPLE: ${{ matrix.triple }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: ${{ contains(matrix.triple, 'windows') && '-C target-feature=+crt-static' || '' }}
       - name: Verify the Windows release needs no C runtime redistributable
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && github.event_name == 'push'
         env:
           TRIPLE: ${{ matrix.triple }}
         run: python scripts/check-windows-imports.py "target/$TRIPLE/release/search.exe"
       - name: Check Windows installer syntax and behavior
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (github.event_name == 'push' || matrix.pr)
         shell: pwsh
         env:
           SEARCH_BUILD_VERSION: v0.0.0
@@ -95,6 +116,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installer fixture build failed' }
           ./scripts/test-install.ps1 -Binary target/debug/search.exe -Version v0.0.0
       - name: Check the installer with Windows PowerShell 5.1
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (github.event_name == 'push' || matrix.pr)
         shell: powershell
         run: ./scripts/test-install.ps1 -Binary target/debug/search.exe -Version v0.0.0
