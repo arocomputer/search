@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
           commit=$(git rev-parse HEAD)
-          result=$(gh run list --workflow ci.yml --commit "$commit" --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
+          result=$(gh run list --workflow ci.yml --branch main --event push --commit "$commit" --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
           [ "$result" = 'completed success' ] || { echo "CI on main ($commit) is '$result'; wait for it to pass." >&2; exit 1; }
           git tag -a "$TAG" -m "$TAG"
           git push origin "$TAG"

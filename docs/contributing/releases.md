@@ -15,8 +15,7 @@ scripts/release.sh v0.2.0    # after merging it: checks CI and dispatches the Ac
 ```
 
 The dispatch must run from `main`; Actions verifies the version, changelog entry,
-and passing CI, then pushes the annotated tag with the org `RELEASE_TOKEN`.
-That token push starts the tag-triggered build and publication workflow.
+and passing CI, then creates the tag and starts the release workflow.
 
 ## What the tag runs
 
@@ -39,19 +38,6 @@ That token push starts the tag-triggered build and publication workflow.
    smoke checks.
 
 Both `formula` and `install` depend on `release` and may run in parallel.
-
-## Who can write to main
-
-The tag job and `formula` job use the org `RELEASE_TOKEN` secret, a fine-grained
-token with Contents read/write access to this repository. The formula job also
-runs in the `release` environment, which only `v*` tags can use. The tag push is
-authenticated with that token so GitHub starts the tag-triggered workflow.
-
-Setting up or replacing the token takes an org admin:
-
-1. Create the `release` environment, limited to tags matching `v*`.
-2. Create a fine-grained PAT with Contents read/write on this repository.
-3. Store it as the org `RELEASE_TOKEN` secret and grant this repository access.
 
 ## Where people get it
 
