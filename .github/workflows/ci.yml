@@ -3,6 +3,7 @@ name: CI
 # PRs run the full suite on Linux and native tests on macOS/Windows. The default
 # branch runs the full six-platform matrix; releases repeat native build/install checks.
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -87,7 +88,7 @@ jobs:
           TMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
           TEMP: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
       - name: Native tests on macOS and Windows PRs
-        if: github.event_name == 'pull_request' && matrix.pr && matrix.name != 'Linux'
+        if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && matrix.pr && matrix.name != 'Linux'
         run: ./x test
         env:
           TMPDIR: ${{ env.SEARCH_TEST_TEMP || runner.temp }}
