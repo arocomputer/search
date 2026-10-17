@@ -1,17 +1,21 @@
 # Releases
 
-A release is a `v*` tag on main. The tag starts the release workflow.
+A release is a `v*` tag on main. The release workflow creates the tag after a
+manual dispatch, then the tag push starts the build and publication jobs.
 
 ## Cutting one
 
-With Git and the authenticated GitHub CLI (`gh`) installed, and permission to
-push a release branch, open its PR, and push tags, use a clean, up-to-date main
-checkout. Choose an unused version with nonempty `Unreleased` notes:
+With Git and the authenticated GitHub CLI (`gh`) installed, use a clean,
+up-to-date main checkout. Choose an unused version with nonempty `Unreleased`
+notes:
 
 ```sh
 scripts/release.sh v0.2.0    # opens a PR naming CHANGELOG.md's Unreleased section v0.2.0
-scripts/release.sh v0.2.0    # after merging it: checks CI passed on main, then tags
+scripts/release.sh v0.2.0    # after merging it: checks CI and dispatches the Actions workflow
 ```
+
+The dispatch must run from `main`; Actions verifies the version, changelog entry,
+and passing CI, then creates the tag and starts the release workflow.
 
 ## What the tag runs
 
@@ -28,28 +32,12 @@ scripts/release.sh v0.2.0    # after merging it: checks CI passed on main, then 
    stamps release identity; binary upgrades do not rewrite settings or private
    trust files.
 4. **formula**: regenerates `search.rb` (`scripts/formula.sh`) for the release and
-   pushes it to main.
+   pushes it to main with commit message `release: vX.Y.Z`.
 5. **install**: a real installer run on all six native runners: `install.sh` for
    Linux/macOS, `install.ps1` for Windows, followed by version and package-store
    smoke checks.
 
 Both `formula` and `install` depend on `release` and may run in parallel.
-
-## Who can write to main
-
-The `formula` job has the `RELEASE_DEPLOY_KEY` write credential and runs in the
-`release` environment, which only `v*` tags can use. To restrict direct updates to
-main, configure branch protection and explicitly allow this deploy key. Without
-that policy, repository write access governs who can push.
-
-Setting it up, or replacing the key, takes an admin of the repository:
-
-1. Create the `release` environment, limited to tags matching `v*`.
-2. Make a key with `ssh-keygen -t ed25519 -N "" -f key` in a temporary folder.
-3. Add `key.pub` as a deploy key with write access, and `key` as the environment's
-   `RELEASE_DEPLOY_KEY` secret; then delete both files.
-4. Configure main's protection policy to allow this deploy key to update the
-   formula.
 
 ## Where people get it
 

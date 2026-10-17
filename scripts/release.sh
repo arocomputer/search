@@ -2,11 +2,11 @@
 # Releases search, from an up-to-date main checkout, in two runs of the same command:
 #
 #   scripts/release.sh v0.2.0    opens a PR that names CHANGELOG.md's Unreleased section v0.2.0
-#   scripts/release.sh v0.2.0    once that PR is merged: checks CI passed on main, then tags
+#   scripts/release.sh v0.2.0    once that PR is merged: checks CI, then asks Actions to tag
 #
-# The tag starts .github/workflows/release.yml, which checks, builds, publishes,
-# updates the Homebrew formula and installs the release. Needs git and gh. Your
-# checkout stays on main.
+# The workflow pushes the tag with RELEASE_TOKEN; that tag starts the release
+# pipeline. Actions builds, publishes, updates the Homebrew formula and tests
+# installation. Needs git and gh. Your checkout stays on main.
 set -eu
 
 fail() { echo "release: $*" >&2; exit 1; }
@@ -32,12 +32,12 @@ if ! grep -q "^## $tag " CHANGELOG.md; then
   sed "s/^## Unreleased\$/## $tag · $(date -u +%Y-%m-%d)/" CHANGELOG.md > "$work/CHANGELOG.md"
   git -C "$work" commit -qam "release: $tag"
   git -C "$work" push -q -u origin "release/$tag"
-  (cd "$work" && gh pr create --title "release: $tag" --body "Names the Unreleased changelog section $tag. After merging, run \`scripts/release.sh $tag\` on main to tag it.")
+  (cd "$work" && gh pr create --title "release: $tag" --body "Names the Unreleased changelog section $tag. After merging, run \`scripts/release.sh $tag\` on main to start the GitHub Actions release.")
   echo "Merge that pull request, pull main, then run scripts/release.sh $tag again."
   exit 0
 fi
 
-# Second run: the section is on main. Tag it once CI has passed there.
+# Second run: the section is on main. Ask Actions to tag it once CI has passed.
 commit=$(git rev-parse HEAD)
 result=$(gh run list --workflow ci.yml --commit "$commit" --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
 case $result in
@@ -45,6 +45,5 @@ case $result in
   "") fail "CI has not run on $commit yet" ;;
   *) fail "CI on $commit is \"$result\"; release once it passes" ;;
 esac
-git tag -a "$tag" -m "$tag"
-git push -q origin "$tag"
-echo "Tagged $tag. The release is building: gh run watch \$(gh run list --workflow release.yml -L 1 --json databaseId -q '.[0].databaseId')"
+gh workflow run release.yml --ref main -f "tag=$tag"
+echo "Asked GitHub Actions to tag $tag and start the release. Watch with: gh run watch \$(gh run list --workflow release.yml -L 1 --json databaseId -q '.[0].databaseId')"

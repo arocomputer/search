@@ -6,12 +6,49 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to publish, such as v0.2.0
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  tag:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+          fetch-depth: 0
+      - name: Validate release and push its tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main || { echo 'Run releases from main.' >&2; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $TAG" >&2; exit 1; }
+          grep -q "^## $TAG " CHANGELOG.md || { echo "CHANGELOG.md has no ## $TAG section" >&2; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists" >&2
+            exit 1
+          fi
+          commit=$(git rev-parse HEAD)
+          result=$(gh run list --workflow ci.yml --branch main --event push --commit "$commit" --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
+          [ "$result" = 'completed success' ] || { echo "CI on main ($commit) is '$result'; wait for it to pass." >&2; exit 1; }
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
   check:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,7 +217,7 @@ jobs:
           test -s notes.md
           gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
 
-  # Only this job writes to main, using the release environment's deploy key.
+  # This job updates the Homebrew formula in main with the org release token.
   formula:
     needs: release
     runs-on: ubuntu-latest
@@ -201,7 +238,7 @@ jobs:
           git diff --cached --quiet && exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -qam "brew: search $TAG"
+          git commit -qam "release: $TAG"
           git push origin HEAD:main
 
   install:
