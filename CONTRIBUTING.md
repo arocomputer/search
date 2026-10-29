@@ -16,6 +16,7 @@ not need Python at runtime.
 
 `./x check` runs, in order:
 
+- Offline formula-publication tests using Python 3, Git, and Git Bash on Windows
 - `./x fmt --check` — `cargo fmt --all --check`
 - `./x lint` — `cargo clippy --locked --all-targets --all-features -- -D warnings`,
   including the all-features build check

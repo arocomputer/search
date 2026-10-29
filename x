@@ -48,6 +48,7 @@ case "$command" in
         ;;
     check)
         [ "$#" -eq 0 ] || usage >&2
+        python3 scripts/test-formula-pr.py
         ./x fmt --check
         ./x lint
         cargo check --locked --no-default-features

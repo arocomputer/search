@@ -32,7 +32,9 @@ and passing CI, then creates the tag and starts the release workflow.
    stamps release identity; binary upgrades do not rewrite settings or private
    trust files.
 4. **formula**: regenerates `search.rb` (`scripts/formula.sh`) for the release and
-   pushes it to main with commit message `release: vX.Y.Z`.
+   opens a bot-owned PR for manual review and merge. Reruns reuse an unchanged
+   bot PR and refuse modified release branches. No PR is opened if main already
+   contains the generated formula. CI is dispatched on the formula branch.
 5. **install**: a real installer run on all six native runners: `install.sh` for
    Linux/macOS, `install.ps1` for Windows, followed by version and package-store
    smoke checks.
@@ -60,15 +62,6 @@ brew tap fschrhunt/search https://github.com/fschrhunt/search
 
 Before releasing, the repository owner must check these settings:
 
-- Make `RELEASE_TOKEN` available as a repository Actions secret. The tag job does
-  not use an environment; an environment-only secret cannot serve it. The token
-  needs access to this repository and permission to push release tags and formula
-  commits. A token push must also be able to start the tag workflow.
-- Reconcile the formula job's direct push to `main` with the active repository
-  ruleset. It requires pull requests and has no bypass actors; a token alone does
-  not bypass that policy. Use a deliberately scoped release automation bypass,
-  or change formula publication to a pull request before releasing. Do not disable
-  branch protections to make the job pass.
 - Check the `release` environment's approvals and deployment restrictions, and
   any external GitHub App installations or token repository selections after the
   ownership change. Keep existing app IDs and required-check integrations.
