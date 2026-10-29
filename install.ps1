@@ -22,7 +22,7 @@ if ([string]::IsNullOrWhiteSpace($Dir)) {
 $Dir = [IO.Path]::GetFullPath($Dir)
 $releases = $env:SEARCH_RELEASES
 if ([string]::IsNullOrWhiteSpace($releases)) {
-    $releases = 'https://github.com/arocomputer/search/releases'
+    $releases = 'https://github.com/fschrhunt/search/releases'
 }
 $releases = $releases.TrimEnd('/')
 

@@ -26,7 +26,7 @@ impl Default for Config {
             address: DEFAULT_ADDRESS.into(),
             home: super::home().unwrap_or_default(),
             user_agent: format!(
-                "search/{} (+https://github.com/arocomputer/search)",
+                "search/{} (+https://github.com/fschrhunt/search)",
                 crate::VERSION
             ),
             search: SearchSettings::default(),

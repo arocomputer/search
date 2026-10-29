@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Update installation, Homebrew, documentation, and repository contact URLs for
+  the move to `fschrhunt/search`; existing settings and protocols stay compatible.
+
 ## v0.1.0 · 2026-10-16
 
 - Refuse only the `3fff::/20` IPv6 documentation range (RFC 9637) instead of the

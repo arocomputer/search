@@ -46,3 +46,34 @@ Both `formula` and `install` depend on `release` and may run in parallel.
   and checks its checksum.
 - [Homebrew](../install.md#homebrew): from `search.rb` at the top of this
   repository, which Homebrew reads as a tap.
+
+## Repository settings after a transfer
+
+Repository URLs and the Homebrew tap are `fschrhunt/search`. Existing settings,
+`SEARCH_HOME`, installer overrides, and protocol names remain compatible. For an
+existing Homebrew installation, replace the old tap before upgrading:
+
+```sh
+brew untap --force arocomputer/search
+brew tap fschrhunt/search https://github.com/fschrhunt/search
+```
+
+Before releasing, the repository owner must check these settings:
+
+- Make `RELEASE_TOKEN` available as a repository Actions secret. The tag job does
+  not use an environment; an environment-only secret cannot serve it. The token
+  needs access to this repository and permission to push release tags and formula
+  commits. A token push must also be able to start the tag workflow.
+- Reconcile the formula job's direct push to `main` with the active repository
+  ruleset. It requires pull requests and has no bypass actors; a token alone does
+  not bypass that policy. Use a deliberately scoped release automation bypass,
+  or change formula publication to a pull request before releasing. Do not disable
+  branch protections to make the job pass.
+- Check the `release` environment's approvals and deployment restrictions, and
+  any external GitHub App installations or token repository selections after the
+  ownership change. Keep existing app IDs and required-check integrations.
+- Enable private vulnerability reporting so the private advisory link in
+  `SECURITY.md` accepts reports.
+
+These settings are managed outside Git; changing repository files does not
+configure them or grant credentials.
