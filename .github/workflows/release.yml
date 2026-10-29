@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   tag:
+    environment: release
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -217,29 +218,32 @@ jobs:
           test -s notes.md
           gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
 
-  # This job updates the Homebrew formula in main with the org release token.
+  # Propose the generated Homebrew formula for manual review and merge.
   formula:
     needs: release
     runs-on: ubuntu-latest
     environment: release
+    concurrency:
+      group: formula-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          token: ${{ secrets.RELEASE_TOKEN }}
-      - name: Point the Homebrew formula at the release
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Propose the Homebrew formula for the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p checksums.txt -O "$RUNNER_TEMP/checksums.txt"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p checksums.txt -O "$RUNNER_TEMP/checksums.txt" --clobber
           scripts/formula.sh "$TAG" "$RUNNER_TEMP/checksums.txt" > search.rb
-          git add search.rb
-          git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -qam "release: $TAG"
-          git push origin HEAD:main
+          scripts/formula-pr.bash "$TAG" search.rb
 
   install:
     needs: release

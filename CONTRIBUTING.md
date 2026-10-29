@@ -7,7 +7,8 @@ Search is a self-hosted web search service in Rust. This is how to change it.
 Rust 1.98 is pinned in `rust-toolchain.toml`; `rustup` will install it on first
 build. Install Python 3 as well: the package tests use it for offline command
 adapter fixtures and the custom engine example. The shipped HTTP engines do
-not need Python at runtime.
+not need Python at runtime. The offline formula PR tests also need Bash, Git,
+and jq.
 
 ```sh
 ./x build     # build the development binary
@@ -17,12 +18,13 @@ not need Python at runtime.
 `./x check` runs, in order:
 
 - `./x fmt --check` — `cargo fmt --all --check`
+- `python3 scripts/test-formula-pr.py` — offline formula PR and retry contracts
 - `./x lint` — `cargo clippy --locked --all-targets --all-features -- -D warnings`,
   including the all-features build check
 - `cargo check --locked --no-default-features` and
   `cargo check --locked --no-default-features --features mcp` — minimal and MCP-only builds
 - `./x test` — the package tests
-- `./x shell` — syntax checks for `x`, `install.sh`, and `scripts/*.sh`
+- `./x shell` — syntax checks for `x`, `install.sh`, `scripts/*.sh`, and the Bash formula publisher
 - `./x guard` — `scripts/guard.sh`, the security-surface audit
 
 CI runs `./x check` natively on Linux, macOS, and Windows, each on x86_64 and ARM64.
