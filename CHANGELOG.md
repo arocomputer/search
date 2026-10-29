@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Release automation proposes Homebrew formula updates through reviewed PRs.
 - Update installation, Homebrew, documentation, and repository contact URLs for
   the move to `fschrhunt/search`; existing settings and protocols stay compatible.
 

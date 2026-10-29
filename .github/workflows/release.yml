@@ -18,6 +18,7 @@ permissions:
 
 jobs:
   tag:
+    environment: release
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -27,11 +28,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          token: ${{ secrets.RELEASE_TOKEN }}
+          persist-credentials: false
           fetch-depth: 0
       - name: Validate release and push its tag
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ inputs.tag }}
         run: |
           test "$GITHUB_REF" = refs/heads/main || { echo 'Run releases from main.' >&2; exit 1; }
@@ -45,7 +47,7 @@ jobs:
           result=$(gh run list --workflow ci.yml --branch main --event push --commit "$commit" --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
           [ "$result" = 'completed success' ] || { echo "CI on main ($commit) is '$result'; wait for it to pass." >&2; exit 1; }
           git tag -a "$TAG" -m "$TAG"
-          git push origin "$TAG"
+          GH_TOKEN="$RELEASE_TOKEN" git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin "$TAG"
 
   check:
     if: github.event_name == 'push'
@@ -217,29 +219,37 @@ jobs:
           test -s notes.md
           gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
 
-  # This job updates the Homebrew formula in main with the org release token.
+  # Propose the published formula through a release PR for normal review.
   formula:
     needs: release
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: homebrew-formula
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          token: ${{ secrets.RELEASE_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Point the Homebrew formula at the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "refs/tags/$TAG^{commit}" origin/main
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          test "$TAG" = "$latest" || { echo "Not the latest stable release; leaving the formula unchanged."; exit 0; }
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p checksums.txt -O "$RUNNER_TEMP/checksums.txt"
           scripts/formula.sh "$TAG" "$RUNNER_TEMP/checksums.txt" > search.rb
-          git add search.rb
-          git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -qam "release: $TAG"
-          git push origin HEAD:main
+          python3 scripts/formula_pr.py
 
   install:
     needs: release
