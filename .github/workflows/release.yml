@@ -219,14 +219,14 @@ jobs:
           test -s notes.md
           gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
 
-  # Propose the published formula through a bot-owned PR for normal review.
+  # Propose the published formula through a release PR for normal review.
   formula:
     needs: release
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
     concurrency:
       group: homebrew-formula
       cancel-in-progress: false

@@ -32,7 +32,7 @@ and passing CI, then creates the tag and starts the release workflow.
    stamps release identity; binary upgrades do not rewrite settings or private
    trust files.
 4. **formula**: regenerates `search.rb` (`scripts/formula.sh`) for the release and
-   opens a bot-owned PR against main. Review and merge after required checks pass;
+   opens a release PR against main. Review and merge after required checks pass;
    automation never merges the PR.
 5. **install**: a real installer run on all six native runners: `install.sh` for
    Linux/macOS, `install.ps1` for Windows, followed by version and package-store
@@ -75,8 +75,9 @@ configure them or grant credentials.
 
 Formula updates only target the latest published release on main. An unchanged
 formula creates no PR. Each release has a dedicated branch; a retry reuses only
-an open bot-owned PR with one formula-only automation commit matching the
-expected content. Human edits and closed PRs require manual review and are never overwritten.
+an open PR from the same author with one formula-only automation commit matching
+the expected content and file mode. Human edits and closed PRs require manual
+review and are never overwritten.
 If branch creation succeeds but PR creation fails, a retry opens the PR only
 after verifying the branch has one matching formula-only automation commit
-based on main. GitHub may require approval of bot PR workflows before checks run.
+based on main.
