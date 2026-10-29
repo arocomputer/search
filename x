@@ -58,6 +58,7 @@ case "$command" in
         PYTHONDONTWRITEBYTECODE=1 python3 tests/evaluate.py
         ./x shell
         ./x guard
+        python3 -m unittest discover -s scripts -p "test_*.py"
         ;;
     guard)
         [ "$#" -eq 0 ] || usage >&2
