@@ -5,7 +5,7 @@
 #   scripts/release.sh v0.2.0    once that PR is merged: checks CI, then asks Actions to tag
 #
 # The workflow pushes the tag with RELEASE_TOKEN; that tag starts the release
-# pipeline. Actions builds, publishes, updates the Homebrew formula and tests
+# pipeline. Actions builds, publishes, proposes a Homebrew formula PR and tests
 # installation. Needs git and gh. Your checkout stays on main.
 set -eu
 

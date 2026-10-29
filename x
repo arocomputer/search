@@ -49,6 +49,7 @@ case "$command" in
     check)
         [ "$#" -eq 0 ] || usage >&2
         ./x fmt --check
+        PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-formula-pr.py
         ./x lint
         cargo check --locked --no-default-features
         cargo check --locked --no-default-features --features mcp
@@ -70,6 +71,7 @@ case "$command" in
     # not a pull request, so it belongs in check.
     shell)
         [ "$#" -eq 0 ] || usage >&2
+        bash -n scripts/formula-pr.bash
         for script in x install.sh scripts/*.sh; do
             sh -n "$script"
         done

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Propose release formula updates in bot pull requests for manual review and merge.
+
 - Update installation, Homebrew, documentation, and repository contact URLs for
   the move to `fschrhunt/search`; existing settings and protocols stay compatible.
 
