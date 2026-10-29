@@ -3,7 +3,7 @@
 ## Reporting
 
 Report a vulnerability through GitHub's private vulnerability reporting on
-<https://github.com/arocomputer/search/security/advisories/new>. Do not open a
+<https://github.com/fschrhunt/search/security/advisories/new>. Do not open a
 public issue for a security problem.
 
 Include what you did, what happened, and what you expected. A proof of concept

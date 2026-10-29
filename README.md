@@ -51,7 +51,7 @@ The shell instructions below are for Linux and macOS. On Windows, use the
 x86_64 and ARM64 CI and release targets.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/arocomputer/search/main/install.sh -o install-search.sh
+curl -fsSL https://raw.githubusercontent.com/fschrhunt/search/main/install.sh -o install-search.sh
 less install-search.sh
 sh install-search.sh
 export PATH="$HOME/.local/bin:$PATH"
